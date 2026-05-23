@@ -48,9 +48,9 @@ if exist "%BUILD_DIR%" (
 set "CMAKE_EXE=cmake"
 where cmake >nul 2>&1
 if !errorlevel! neq 0 (
-    set "CMAKE_EXE=%ProgramFiles(x86)%\Microsoft Visual Studio\2022\BuildTools\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe"
+    set "CMAKE_EXE=%ProgramFiles(x86)%\Microsoft Visual Studio\18\Community\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe"
     if not exist "!CMAKE_EXE!" (
-        set "CMAKE_EXE=%ProgramFiles%\Microsoft Visual Studio\2022\BuildTools\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe"
+        set "CMAKE_EXE=%ProgramFiles%\Microsoft Visual Studio\18\Community\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe"
     )
     if not exist "!CMAKE_EXE!" (
         echo [ERROR] cmake not found. Add cmake to PATH or install VS Build Tools 2022.
