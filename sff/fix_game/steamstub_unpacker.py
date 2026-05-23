@@ -219,7 +219,13 @@ class SteamStubUnpacker:
         return False
 
     def restore_directory(self, directory, log_func=None):
-        """restore all .steamstub.bak files in a directory"""
+        """Restore all .steamstub.bak files in a directory.
+
+        Returns the count of files restored. Skips SteaMidra's own
+        backup folders (`.steamidra_exe_backups/`, `.steamlocked.bak/`,
+        `saved_lua/`, `manifests/`) so revert doesn't process stale
+        backups that were never paired with a live exe.
+        """
         def log(msg):
             if log_func:
                 log_func(msg)
@@ -227,16 +233,17 @@ class SteamStubUnpacker:
         game_dir = Path(directory)
         restored = 0
         for bak in game_dir.rglob("*.steamstub.bak"):
-            original = bak.with_suffix("")  # remove .steamstub.bak
-            # the original path needs the .exe extension too
-            # bak name: foo.exe.steamstub.bak -> original: foo.exe
+            if any(part in SKIP_DIR_NAMES for part in bak.parts):
+                continue
+            # Strip the .steamstub.bak suffix to recover the original .exe path.
             original_name = bak.name.replace(".steamstub.bak", "")
             original_path = bak.parent / original_name
             try:
                 shutil.copy2(bak, original_path)
                 bak.unlink()
                 restored += 1
+                log(f"Restored {original_name}")
             except Exception as e:
                 log(f"Failed to restore {original_name}: {e}")
-        log(f"Restored {restored} file(s)")
+        log(f"Restored {restored} SteamStub backup(s)")
         return restored

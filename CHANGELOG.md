@@ -2,6 +2,13 @@
 
 ## 6.2.3
 
+### SteaMidra — Revert Fix Game changes actually works
+
+- Web UI Revert button was calling `FixGameService.revert(path)` — a method that doesn't exist anywhere. Crashed with `AttributeError` and silently failed. Fixed: instantiate `FixGameService()` and call `restore_game(path)`, the real method
+- `restore_game` now distinguishes "had nothing to revert" from "reverted N files" instead of always reporting success. Clean folder gives a clear "Nothing to revert in this folder — no Fix Game backups, no steam_settings/, no launch scripts" toast instead of a misleading "Changes reverted"
+- Returns a proper summary: `Reverted: 2 SteamStub backup(s), restored 3 file(s), 1 launch script(s)`
+- `SteamStubUnpacker.restore_directory` now skips SteaMidra's own backup folders during recursion (`.steamidra_exe_backups/`, `.steamlocked.bak/`, `saved_lua/`, `manifests/`) so revert can't process stale backups that were never paired with a live exe. Also returns the actual count of restored files so the caller can report it
+
 ### LumaCore
 
 - Full debug coverage on every IPC, network, hook, registry probe (verbose log mode, defaults on)

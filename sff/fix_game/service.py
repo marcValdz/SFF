@@ -272,6 +272,11 @@ class FixGameService:
     def restore_game(self, game_dir, log_func=None):
         """
         Undo all Fix Game changes — restore originals, delete configs.
+
+        Returns (success, message). success=False when there was literally
+        nothing to revert (no backups, no configs, no launch scripts), so
+        the user gets a clear "nothing to do" instead of a misleading
+        "Changes reverted" toast on a clean folder.
         """
         def log(msg):
             if log_func:
@@ -279,16 +284,44 @@ class FixGameService:
             logger.info(msg)
         log("=== Restoring Game ===")
         # restore SteamStub backups
-        self.unpacker.restore_directory(game_dir, log_func=log)
+        stub_restored = self.unpacker.restore_directory(game_dir, log_func=log)
         # restore Goldberg changes
-        success, msg = self.applier.restore(game_dir, log_func=log)
+        gb_ok, gb_msg = self.applier.restore(game_dir, log_func=log)
         # delete launch scripts
         game_path = Path(game_dir)
+        bat_count = 0
         for bat in game_path.glob("Launch*.bat"):
-            bat.unlink()
-            log(f"Deleted {bat.name}")
+            try:
+                bat.unlink()
+                log(f"Deleted {bat.name}")
+                bat_count += 1
+            except OSError as e:
+                log(f"Failed to delete {bat.name}: {e}")
         log("=== Restore Complete ===")
-        return success, msg
+
+        # Combined report. stub_restored is the count returned by
+        # SteamStubUnpacker.restore_directory; gb_msg already says
+        # "Restored N file(s)" or "No backups to restore".
+        nothing_done = (
+            (not stub_restored)
+            and gb_msg.startswith("No backups")
+            and bat_count == 0
+        )
+        if nothing_done:
+            return False, (
+                "Nothing to revert in this folder — no Fix Game backups, "
+                "no steam_settings/, no launch scripts. Either Fix Game "
+                "was never applied here or the changes are already reverted."
+            )
+        parts = []
+        if stub_restored:
+            parts.append(f"{stub_restored} SteamStub backup(s)")
+        if gb_msg and not gb_msg.startswith("No backups"):
+            parts.append(gb_msg.lower())
+        if bat_count:
+            parts.append(f"{bat_count} launch script(s)")
+        summary = "Reverted: " + ", ".join(parts) if parts else "Revert complete"
+        return True, summary
 
     def check_drm(self, app_id, log_func=None):
         """

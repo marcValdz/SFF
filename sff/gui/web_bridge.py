@@ -734,17 +734,22 @@ class WebBridge(QObject):
         """Revert emulator changes."""
         def _do():
             try:
-                from sff.gui.fix_game_tab import FixGameService
-                FixGameService.revert(game_path)
-                return True
+                from sff.fix_game.service import FixGameService
+                # FixGameService is not stateless — instantiate then call.
+                # Returns (success, message) tuple.
+                svc = FixGameService()
+                success, msg = svc.restore_game(game_path)
+                return (bool(success), str(msg) if msg else "Changes reverted")
             except Exception as e:
-                return str(e)
+                logger.exception("revert_game failed")
+                return (False, f"Revert failed: {e}")
 
         def _on_done(result):
-            if result is True:
-                self._emit_task_result("revert_game", True, "Changes reverted")
+            if isinstance(result, tuple) and len(result) == 2:
+                ok, msg = result
+                self._emit_task_result("revert_game", bool(ok), str(msg))
             else:
-                self._emit_task_result("revert_game", False, str(result))
+                self._emit_task_result("revert_game", False, "Revert failed: unexpected result")
 
         self._run_async(_do, on_done=_on_done)
 
