@@ -37,7 +37,6 @@ class LumaCoreManager(AppInjectionManager):
     def __init__(self, steam_path: Path, provider: SteamInfoProvider):
         self.steam_path = steam_path
         self.provider = provider
-        self.applist_folder = None
 
     @property
     def stplug_in(self) -> Path:
@@ -65,7 +64,6 @@ class LumaCoreManager(AppInjectionManager):
         from sff.structs import DLCTypes, MainReturnCode
         from rich.console import Console
         from rich.table import Column, Table
-        from sff.prompts import prompt_confirm
 
         console = Console()
 
@@ -97,7 +95,7 @@ class LumaCoreManager(AppInjectionManager):
             Column("Status", style="cyan"),
             Column("DLC ID", style="white"),
             Column("Name", style="white"),
-            title=f"DLC List — App {base_id}",
+            title=f"DLC List \u2014 App {base_id}",
         )
         missing = []
         for dlc_id in dlc_ids:
@@ -109,15 +107,13 @@ class LumaCoreManager(AppInjectionManager):
 
         console.print(table)
 
-        if not missing:
-            print(Fore.GREEN + "All DLCs are unlocked." + Style.RESET_ALL)
-            return MainReturnCode.LOOP_NO_PROMPT
-
-        print(Fore.YELLOW + f"{len(missing)} DLC(s) not unlocked." + Style.RESET_ALL)
-        if prompt_confirm("Add missing DLCs to the Lua file?"):
+        if missing:
             print(
                 Fore.YELLOW
-                + "To add DLCs, re-download the game's Lua file via 'Download Games'."
+                + f"{len(missing)} DLC(s) not unlocked. "
+                  "Re-download the game's Lua via Download Games to add them."
                 + Style.RESET_ALL
             )
+        else:
+            print(Fore.GREEN + "All DLCs are unlocked." + Style.RESET_ALL)
         return MainReturnCode.LOOP_NO_PROMPT

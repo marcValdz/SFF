@@ -37,6 +37,7 @@ from typing import Callable
 _EXE_PATHS = [
     "third_party/SteamAutoCrack/cli/SteamAutoCrack.CLI.exe",
     "third_party/Codes to use/SteamAuto Code/SteamAuto/SteamAutoCrack.CLI/publish_x86/SteamAutoCrack.CLI.exe",
+    "third_party/Codes to use/SteamAuto Code/SteamAuto/SteamAutoCrack.CLI/bin/x86/Release/net10.0-windows/win-x86/SteamAutoCrack.CLI.exe",
     "third_party/Codes to use/SteamAuto Code/SteamAuto/SteamAutoCrack.CLI/bin/x86/Release/net9.0-windows/win-x86/SteamAutoCrack.CLI.exe",
 ]
 # Note: the project targets x86 so dotnet run / dotnet <dll> requires an x86 .NET runtime.
@@ -144,8 +145,18 @@ def run_steamauto(
     game_path: Path,
     app_id: str,
     *,
+    mode: str = "full",
     print_func = print,
 ):
+    """Run SteamAutoCrack in either full mode (default) or steamless-only.
+
+    mode='full'           — original behaviour: generate emu game info,
+                            generate emu config, unpack steamstub, apply
+                            Goldberg emulator. Breaks Steam achievements.
+    mode='steamless_only' — only unpack steamstub. Skips all four
+                            Goldberg / EMU process steps. Achievement-safe
+                            because the Steam API stays intact.
+    """
     game_path = game_path.resolve()
     cli = get_steamauto_cli_path()
     if cli is None:
@@ -160,6 +171,20 @@ def run_steamauto(
     # Ensure the API key is set in the CLI config (prevents NO LICENSE errors)
     _ensure_config_has_api_key(cli.parent)
 
+    # Steamless-only mode: write a temporary process-config that turns off
+    # every Goldberg / EMU step. The CLI's `crack` command honours
+    # ProcessConfigs; setting Generate*EMU* / ApplyEMU to false makes the
+    # whole pipeline collapse to "unpack steamstub" only.
+    config_arg = []
+    temp_cfg = None
+    if mode == "steamless_only":
+        try:
+            temp_cfg = _write_steamless_only_config(cli.parent)
+            config_arg = ["--config", str(temp_cfg)]
+            print_func("[SteaMidra] SteamAutoCrack: STEAMLESS-ONLY mode (no Goldberg / no EMU).")
+        except Exception as exc:
+            print_func(f"[SteaMidra] Could not write steamless-only config ({exc}); falling back to full mode.")
+
     # Safety: snapshot all game executables before the CLI touches them
     print_func("[SteaMidra] Backing up game executables before cracking...")
     backups = _snapshot_executables(game_path)
@@ -168,7 +193,7 @@ def run_steamauto(
     else:
         print_func("[SteaMidra] No executables found in game directory.")
 
-    cmd = [str(cli), "crack", str(game_path), "--appid", app_id or "0"]
+    cmd = [str(cli), "crack", str(game_path), "--appid", app_id or "0", *config_arg]
     print_func("Running: " + " ".join(cmd) + "\n")
     proc = subprocess.Popen(
         cmd,
@@ -193,4 +218,44 @@ def run_steamauto(
             "The cracking process may not have completed successfully — "
             "try again or use a different method."
         )
+
+    # Clean up the steamless-only config so the next run starts from
+    # whatever the CLI's default is.
+    if temp_cfg is not None:
+        try:
+            temp_cfg.unlink(missing_ok=True)
+        except OSError:
+            pass
     return proc.returncode
+
+
+def _write_steamless_only_config(cli_dir: Path) -> Path:
+    """Write a one-shot config.json that turns off every emulator /
+    Goldberg / generator step, leaving only Unpack=true (SteamStub).
+
+    Returns the path to the written file. Caller deletes it after the
+    run. We base the override on whatever the CLI already has so any
+    user customisation (Steamless flag set, debug log, etc) is kept.
+    """
+    base_cfg_path = cli_dir / "config.json"
+    base = {}
+    if base_cfg_path.exists():
+        try:
+            base = json.loads(base_cfg_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            base = {}
+    if not isinstance(base, dict):
+        base = {}
+    process = base.setdefault("ProcessConfigs", {}) if isinstance(base.get("ProcessConfigs"), dict) else {}
+    base["ProcessConfigs"] = {
+        **(process if isinstance(process, dict) else {}),
+        "GenerateEMUGameInfo": False,
+        "GenerateEMUConfig": False,
+        "Unpack": True,
+        "ApplyEMU": False,
+        "GenerateCrackOnly": False,
+        "Restore": False,
+    }
+    out = cli_dir / "config.steamless_only.json"
+    out.write_text(json.dumps(base, indent=2), encoding="utf-8")
+    return out

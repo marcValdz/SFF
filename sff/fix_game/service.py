@@ -402,7 +402,7 @@ class FixGameService:
         # fallback: ColdClient loader (Windows native or Linux Proton/Wine)
         is_coldclient = emu_mode in ("coldclient_loader", "coldclient_simple", "coldclient_advanced")
         if is_coldclient:
-            for loader in ["steamclient_loader_x64.exe", "steamclient_loader_x32.exe"]:
+            for loader in ["steamclient_loader_x64.exe", "steamclient_loader_x86.exe", "steamclient_loader_x32.exe"]:
                 if (game_path / loader).exists():
                     if is_wine_mode:
                         sh_content = f'#!/bin/sh\ncd "$(dirname \"$0\")"\nexec wine "{loader}"\n'

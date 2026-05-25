@@ -44,6 +44,7 @@ from sff.manifest.id_resolver import (
 from sff.prompts import prompt_confirm, prompt_select, prompt_text
 from sff.steam_client import SteamInfoProvider, get_product_info
 from sff.storage.settings import get_setting
+from sff.utils import manifests_staging_dir
 from sff.structs import (  # type: ignore
     DepotManifestMap,
     LuaParsedInfo,
@@ -64,9 +65,10 @@ class ManifestDownloader:
         self.use_hubcap = use_hubcap
 
     def _preseed_depotcache(self):
-        # Copy everything from ./manifests/ into depotcache now so Steam
-        # finds them locally and never needs a network call.
-        manifests_dir = Path.cwd() / "manifests"
+        # Copy everything from the staging dir into depotcache now so
+        # Steam finds them locally and never needs a network call.
+        from sff.utils import manifests_staging_dir
+        manifests_dir = manifests_staging_dir()
         if not manifests_dir.exists():
             return 0
         depotcache = self.steam_path / "depotcache"
@@ -414,14 +416,10 @@ class ManifestDownloader:
             result = get_request_raw(manifest_url)
             if result is not None:
                 return result
-        # Step 2: ManifestHub API + GitHub simultaneously (API preferred)
-        if app_id:
-            mh_result = self._try_manifesthub_combined(depot_id, manifest_id, app_id)
-        else:
-            mh_result = self._try_manifesthub(depot_id, manifest_id)
-        if mh_result is not None:
-            return mh_result
-        # Step 3 (interactive CDN) handled by the caller
+        # No further parallel sources for oureveryday — keeping the
+        # provider self-contained avoids the request fan-out racing the
+        # primary endpoint. Caller falls through to the interactive CDN
+        # fetch (Step 3) when this returns None.
         return None
 
     def resolve_gmrc(self, manifest_id):
@@ -500,7 +498,7 @@ class ManifestDownloader:
             depotcache = self.steam_path / "depotcache"
             depotcache.mkdir(exist_ok=True)
             final_manifest_loc = depotcache / f"{depot_id}_{manifest_id}.manifest"
-            possible_saved_manifest = Path.cwd() / f"manifests/{depot_id}_{manifest_id}.manifest"
+            possible_saved_manifest = manifests_staging_dir() / f"{depot_id}_{manifest_id}.manifest"
             # If saved manifest exists (from Morrenus ZIP), refresh depotcache
             if possible_saved_manifest.exists():
                 shutil.copy2(str(possible_saved_manifest), final_manifest_loc)
@@ -617,7 +615,7 @@ class ManifestDownloader:
             try:
                 final_manifest_loc = depotcache / f"{depot_id}_{manifest_id}.manifest"
                 # Prefer saved manifest (from Morrenus ZIP) over stale depotcache
-                possible_saved_manifest = Path.cwd() / f"manifests/{depot_id}_{manifest_id}.manifest"
+                possible_saved_manifest = manifests_staging_dir() / f"{depot_id}_{manifest_id}.manifest"
                 if possible_saved_manifest.exists():
                     shutil.copy2(possible_saved_manifest, final_manifest_loc)
                     sync_manifest_to_config_depotcache(self.steam_path, final_manifest_loc)

@@ -80,6 +80,28 @@ def root_folder(outside_internal = False):
         return root
 
 
+def manifests_staging_dir() -> Path:
+    """Canonical staging directory for downloaded .manifest files.
+
+    Used by:
+      * sff.zip — extracts manifests from provider ZIPs into here
+      * sff.manifest.downloader — refreshes depotcache from here, prefers
+        these over stale depotcache copies
+      * sff.linux.linux_download — collects manifests for DDMod forwarding
+
+    Cannot use Path.cwd() because cwd flips between repo root (dev),
+    AppImage mount point (frozen Linux build), and arbitrary launch
+    directory (when invoked from the Web UI). The result is a quiet
+    "no manifests found, fall through to anonymous CDN fetch" failure
+    that ends in a 401 inside DDMod.
+
+    Returns the writable user-data root + "manifests/", creating it.
+    """
+    out = root_folder(outside_internal=True) / "manifests"
+    out.mkdir(parents=True, exist_ok=True)
+    return out
+
+
 def enter_path(
 
     obj,

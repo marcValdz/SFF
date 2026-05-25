@@ -64,7 +64,7 @@ except Exception as e:
 
 logger = logging.getLogger("sff")
 logger.setLevel(logging.DEBUG)
-fh = logging.FileHandler(str(sff_data_dir() / "debug.log"))
+fh = logging.FileHandler(str(sff_data_dir() / "debug.log"), encoding="utf-8", errors="replace")
 fh.setFormatter(
     logging.Formatter(
         "%(asctime)s::%(name)s::%(levelname)s::%(message)s",
@@ -89,9 +89,18 @@ def get_steam_path_gui():
         except Exception:
             pass
     elif sys.platform == "linux":
-        steam_dir = Path.home() / ".steam/root"
-        if steam_dir.exists() and validate_steam_path(steam_dir):
-            return steam_dir.resolve()
+        # The CLI's sff.steam_path.LinuxFinder already covers the common
+        # native (.steam/steam, .local/share/Steam), Flatpak, and Snap
+        # layouts. The GUI used to only probe ~/.steam/root, which exists
+        # on Ubuntu/Debian but not on CachyOS, Arch, or Flatpak installs.
+        # Reuse the CLI finder so the GUI matches CLI behaviour everywhere.
+        from sff.steam_path import LinuxFinder
+        try:
+            p = LinuxFinder().find()
+            if p is not None:
+                return p
+        except Exception:
+            pass
     return None
 
 
@@ -219,10 +228,66 @@ def main():
     window.set_tray(tray)
     # Keep a reference on app to prevent garbage collection
     app._tray = tray
+
+    # Explorer can crash and re-broadcast TaskbarCreated; Qt does not
+    # deliver that broadcast to widgets, so the icon stays gone until
+    # the next process start unless we hook it at the app level.
+    if sys.platform == "win32":
+        import ctypes
+        from ctypes import wintypes
+        from PyQt6.QtCore import QAbstractNativeEventFilter
+
+        _TASKBAR_CREATED_MSG = ctypes.windll.user32.RegisterWindowMessageW("TaskbarCreated")
+
+        class _MSG(ctypes.Structure):
+            _fields_ = [
+                ("hwnd", wintypes.HWND),
+                ("message", wintypes.UINT),
+                ("wParam", wintypes.WPARAM),
+                ("lParam", wintypes.LPARAM),
+                ("time", wintypes.DWORD),
+                ("pt", wintypes.POINT),
+            ]
+
+        class TaskbarCreatedFilter(QAbstractNativeEventFilter):
+            def nativeEventFilter(self, event_type, message):
+                if event_type == b"windows_generic_MSG":
+                    try:
+                        msg = _MSG.from_address(int(message))
+                        if msg.message == _TASKBAR_CREATED_MSG:
+                            tray.setup(_app_icon if not _app_icon.isNull() else app.windowIcon())
+                            tray.show()
+                    except Exception:
+                        pass
+                return False, 0
+
+        _taskbar_filter = TaskbarCreatedFilter()
+        app.installNativeEventFilter(_taskbar_filter)
+        # Strong ref so Qt does not GC the filter.
+        app._taskbar_filter = _taskbar_filter
     tray.show_requested.connect(window.showNormal)
     tray.show_requested.connect(window.activateWindow)
     tray.exit_requested.connect(app.quit)
     tray.exit_requested.connect(window.force_quit)
+
+    # A13: explicit "Quit SteaMidra" entry on the tray context menu,
+    # alongside the existing Exit. Always full-quits regardless of
+    # CLOSE_TO_TRAY. Exit stays as-is (no rename, no rewire).
+    from PyQt6.QtGui import QAction as _QAction
+
+    def _on_tray_quit_steamidra():
+        try:
+            window.force_quit()
+        finally:
+            app.quit()
+
+    _tray_menu = tray._menu if hasattr(tray, "_menu") else None
+    if _tray_menu is not None:
+        _quit_action = _QAction("Quit SteaMidra", _tray_menu)
+        _quit_action.triggered.connect(_on_tray_quit_steamidra)
+        _tray_menu.addAction(_quit_action)
+        # Hold a strong ref so Qt does not GC the action.
+        app._tray_quit_action = _quit_action
 
     def _on_show_from_second_instance():
         window.showNormal()
@@ -235,6 +300,74 @@ def main():
     from sff.uri_handler import UriHandler
     if not UriHandler.is_registered():
         UriHandler.register()
+
+    # mirror Main.py:551-555 for the GUI entry point; defer so window.show() paints first
+    if sys.platform == "linux":
+        from PyQt6.QtCore import QTimer
+
+        def _run_slssteam_update_check():
+            try:
+                from sff.linux.slssteam import check_and_notify_update
+                check_and_notify_update()
+            except Exception:
+                pass
+
+        QTimer.singleShot(0, _run_slssteam_update_check)
+
+    # A9: startup self-update popup. Defer 2s so the window paints first.
+    # The whole body is wrapped so a GitHub failure or dialog construction
+    # error never crashes the GUI (preservation requirement 3.20).
+    from PyQt6.QtCore import QTimer
+
+    def _maybe_self_update():
+        try:
+            auto = get_setting(Settings.AUTO_UPDATE_CHECK)
+            # Default ON: only the explicit False / "False" disables it.
+            if auto is False or (isinstance(auto, str) and auto.lower() == "false"):
+                return
+            from sff.updater import Updater, fetch_release_notes
+            try:
+                is_newer, release = Updater.update_available()
+            except Exception:
+                return
+            if not is_newer or not release:
+                return
+            new_version = (release.get("tag_name") or "").strip()
+            if not new_version:
+                return
+            skipped = get_setting(Settings.LAST_SKIPPED_VERSION) or ""
+            if skipped == new_version:
+                return
+            notes = fetch_release_notes(new_version)
+            from sff.gui.dialogs.self_update_dialog import SelfUpdateDialog
+            dlg = SelfUpdateDialog(window, new_version, notes)
+
+            def _do_download():
+                # Reuse the manual update flow from the Settings button.
+                try:
+                    ui.check_updates(ui.os_type)
+                except Exception:
+                    pass
+
+            def _do_skip():
+                try:
+                    set_setting(Settings.LAST_SKIPPED_VERSION, new_version)
+                except Exception:
+                    pass
+
+            dlg.download_now.connect(_do_download)
+            dlg.skip_this_version.connect(_do_skip)
+            # remind_later just dismisses; nothing to wire.
+            dlg.show()
+            # Hold a reference so Qt does not garbage-collect the dialog.
+            window._self_update_dialog = dlg
+        except Exception:
+            pass
+
+    QTimer.singleShot(2000, _maybe_self_update)
+
+    # A15: manifest preserver watcher is now started inside
+    # SFFMainWindow.__init__ on a daemon thread. Nothing to do here.
 
     sys.exit(app.exec())
 

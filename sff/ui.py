@@ -19,6 +19,7 @@
 import functools
 import logging
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -1216,11 +1217,11 @@ class UI:
                 )
             else:
                 # When frozen, do not relaunch—user must rebuild. Otherwise relaunch via python Main.py.
-                launcher_shell = "exec " + " ".join(shutil.quote(str(x)) for x in [sys.executable, str(app_dir / "Main.py")]) + "\n"
+                launcher_shell = "exec " + " ".join(shlex.quote(str(x)) for x in [sys.executable, str(app_dir / "Main.py")]) + "\n"
                 updater_sh = app_dir / "tmp_updater.sh"
                 updater_sh.write_text(
                     "#!/bin/sh\n"
-                    "cd " + shutil.quote(str(app_dir.resolve())) + "\n"
+                    "cd " + shlex.quote(str(app_dir.resolve())) + "\n"
                     "sleep 2\n"
                     "cp -r tmp_update/. .\n"
                     "rm -rf tmp_update update.zip\n"
@@ -1318,7 +1319,7 @@ class UI:
                 logger.warning("Linux update: steamidra_install.sh missing from %s", tmp_update)
                 return
             install_sh.chmod(0o755)
-            install_cmd = f"cd {shutil.quote(str(tmp_update))} && bash steamidra_install.sh; exec bash"
+            install_cmd = f"cd {shlex.quote(str(tmp_update))} && bash steamidra_install.sh; exec bash"
             terminals = [
                 ["x-terminal-emulator", "-e", "bash", "-c", install_cmd],
                 ["gnome-terminal", "--", "bash", "-c", install_cmd],
@@ -1379,12 +1380,7 @@ class UI:
         provider = self._steam_provider()
         downloader = ManifestDownloader(provider, self.steam_path)
         steam_proc = (
-            SteamProcess(
-                self.steam_path,
-                self.app_list_man.applist_folder if (
-                    self.app_list_man and getattr(self.app_list_man, 'applist_folder', None)
-                ) else None,
-            )
+            SteamProcess(self.steam_path)
             if self.os_type == OSType.WINDOWS else None
         )
         excluded_set = set(

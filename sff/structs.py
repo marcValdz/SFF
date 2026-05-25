@@ -217,12 +217,66 @@ class Settings(Enum):
     CLOUD_PROVIDER = SettingItem("cloud_provider", "Cloud Save Provider", False, str)
     CLOUD_RCLONE_EXE = SettingItem("cloud_rclone_exe", "Cloud Save rclone Executable", False, str)
     CLOUD_RCLONE_REMOTE = SettingItem("cloud_rclone_remote", "Cloud Save rclone Remote", False, str)
+    # 6.2.4: per-game custom save paths the user added by hand. Stored as
+    # JSON {"<app_id>": "<absolute path>"} so the cloud-saves "All Save
+    # Locations" scan picks them up alongside emu / Steam-userdata folders.
+    CLOUD_CUSTOM_SAVE_PATHS = SettingItem(
+        "cloud_custom_save_paths",
+        "Custom Save Paths Per Game (managed via Cloud Saves UI)",
+        False, str,
+    )
     CLOSE_TO_TRAY = SettingItem("close_to_tray", "Close button hides to tray (off = quit)", False, bool)
     WARN_BEFORE_BREAKING_ACHIEVEMENTS = SettingItem(
         "warn_before_breaking_achievements",
         "Warn before running actions that break Steam achievements",
         False,
         bool,
+    )
+    # SteamAutoCrack default mode. When set, skips the "Apply Both vs
+    # Steamless Only" picker dialog and runs that mode directly. Empty
+    # string means ask every time (the default behaviour). Valid values:
+    # "" (ask), "full" (Goldberg + Steamless), "steamless_only".
+    STEAMAUTO_DEFAULT_MODE = SettingItem(
+        "steamauto_default_mode",
+        "SteamAutoCrack default mode (empty = ask each time)",
+        False,
+        str,
+    )
+    # A9: startup self-update popup (default ON, toggle in Settings page)
+    AUTO_UPDATE_CHECK = SettingItem("auto_update_check", "Check for updates on startup", False, bool)
+    LAST_SKIPPED_VERSION = SettingItem("last_skipped_version", "Last Skipped Update Version (managed automatically)", False, str)
+    # A12: Bulk Import Queue mode. "process_immediately" starts the drain
+    # as soon as files are enqueued; "collect_then_confirm" waits for the
+    # user to confirm before processing. Single-file imports never see
+    # this setting.
+    BULK_IMPORT_MODE = SettingItem("bulk_import_mode", "Bulk Import Mode", False, str)
+    # A15: back up depotcache manifests so a Steam uninstall does not nuke
+    # the work SteaMidra registered. Default ON; the off-switch disables
+    # backup, watcher, and restore in lockstep.
+    MANIFEST_PRESERVE = SettingItem("manifest_preserve", "Preserve manifests when Steam uninstalls a game (recommended)", False, bool)
+    # A17: widen the Store list filter to {game, application} so software
+    # titles surface alongside games. Default ON; an explicit False clamps
+    # the list back to type "game" only and matches pre-A17 behavior.
+    STORE_SHOW_SOFTWARE = SettingItem("store_show_software", "Show software in Store", False, bool)
+    # LumaCore version tracking. Both fields are managed by sff.lumacore_setup
+    # and never surface in the Settings UI directly.
+    LUMACORE_INSTALLED_VERSION = SettingItem(
+        "lumacore_installed_version",
+        "LumaCore Installed Version (managed automatically)",
+        False,
+        str,
+    )
+    LUMACORE_LATEST_VERSION = SettingItem(
+        "lumacore_latest_version",
+        "LumaCore Latest Known Version (managed automatically)",
+        False,
+        str,
+    )
+    LUMACORE_LAST_CHECK = SettingItem(
+        "lumacore_last_check",
+        "LumaCore Last Update Check (UTC epoch, managed automatically)",
+        False,
+        str,
     )
 
     @property

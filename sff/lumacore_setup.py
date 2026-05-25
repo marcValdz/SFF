@@ -430,4 +430,273 @@ def install_lumacore(
 
     msg = "LumaCore installed."
     _progress(msg, progress_callback)
+    # Record the version we just installed so check_for_lumacore_update can
+    # compare against the latest GitHub release on subsequent launches. Best
+    # effort — the install itself is already done at this point.
+    try:
+        installed_tag = _fetch_latest_release_tag(timeout=5.0)
+        if installed_tag:
+            remember_installed_lumacore_version(installed_tag)
+    except Exception:
+        pass
+    return True, msg
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# LumaCore version checker
+# ─────────────────────────────────────────────────────────────────────────
+#
+# Releases on github.com/KoriaPolis/LumaCore are tagged like "V4", "V5", etc.
+# The release name is "LumaCore V4". We compare the latest tag from GitHub
+# against the value cached in settings under LUMACORE_INSTALLED_VERSION and
+# treat a mismatch as "update available".
+#
+# Cadence: at most one HTTP probe per 6 hours, regardless of how many times
+# this runs in a session. Cached result lives in Settings.LUMACORE_LAST_CHECK
+# / Settings.LUMACORE_LATEST_VERSION so the user sees the answer immediately
+# on the next launch without another network round-trip.
+
+_LC_VERSION_CHECK_INTERVAL = 6 * 60 * 60  # 6 hours
+
+
+def _normalise_lc_version(raw: str) -> str:
+    """Trim/normalise a tag or release name so 'V4', 'v4', 'LumaCore V4', etc.
+    all collapse to the same key. Returns the bare version token (e.g. 'V4').
+    Empty input → empty output.
+    """
+    if not raw:
+        return ""
+    token = raw.strip()
+    # Drop a leading "LumaCore " label if the tag was actually the release name.
+    lower = token.lower()
+    if lower.startswith("lumacore"):
+        token = token[len("lumacore"):].strip()
+    # Normalise the V to uppercase so "v4" and "V4" compare equal.
+    if token.startswith(("v", "V")):
+        token = "V" + token[1:]
+    return token
+
+
+def _fetch_latest_release_tag(timeout: float = 10.0) -> Optional[str]:
+    """Hit /releases/latest and pull the tag_name. None on any failure.
+    Caller is responsible for logging — this just returns the value.
+    """
+    try:
+        resp = httpx.get(
+            _LUMACORE_RELEASE_API,
+            headers={"Accept": "application/vnd.github+json"},
+            timeout=timeout,
+            follow_redirects=True,
+        )
+        resp.raise_for_status()
+        payload = resp.json()
+        # tag_name is the canonical version anchor; release name is a friendlier
+        # display fallback.
+        return _normalise_lc_version(
+            payload.get("tag_name") or payload.get("name") or ""
+        ) or None
+    except Exception as exc:
+        logger.debug("LumaCore release tag fetch failed: %s", exc)
+        return None
+
+
+def get_installed_lumacore_version(steam_path: Path) -> str:
+    """Return the version label SteaMidra last installed. Empty when LumaCore
+    isn't installed (or was installed by a build that never wrote the tag).
+    """
+    from sff.storage.settings import get_setting
+    from sff.structs import Settings
+
+    # Only treat the cached version as authoritative when the actual DLLs are
+    # still on disk. Removing the DLLs by hand should reset the perceived
+    # install so the next "Auto LC Setup" actually re-runs.
+    for dll in _LC_DLLS:
+        if not (steam_path / dll).is_file():
+            return ""
+    saved = get_setting(Settings.LUMACORE_INSTALLED_VERSION) or ""
+    return _normalise_lc_version(str(saved))
+
+
+def remember_installed_lumacore_version(version: str) -> None:
+    """Persist the version label SteaMidra just installed."""
+    from sff.storage.settings import set_setting
+    from sff.structs import Settings
+
+    set_setting(Settings.LUMACORE_INSTALLED_VERSION, _normalise_lc_version(version))
+
+
+def check_for_lumacore_update(steam_path: Path, force: bool = False) -> dict:
+    """Compare the installed LumaCore version against the latest GitHub
+    release. Returns a dict with:
+        installed:        version currently on disk (or "" if absent)
+        latest:           latest version on GitHub (or "" on network failure)
+        update_available: True when the two differ AND both are populated
+        checked_at:       unix timestamp of the network probe (or cache hit)
+        source:           "remote" if we hit GitHub this call, "cache" otherwise
+
+    Honours a 6-hour cooldown between remote calls unless force=True. Reads
+    and writes Settings.LUMACORE_LATEST_VERSION / LUMACORE_LAST_CHECK so the
+    answer survives across sessions.
+    """
+    import time
+    from sff.storage.settings import get_setting, set_setting
+    from sff.structs import Settings
+
+    installed = get_installed_lumacore_version(steam_path)
+
+    cached_latest = _normalise_lc_version(
+        str(get_setting(Settings.LUMACORE_LATEST_VERSION) or "")
+    )
+    try:
+        last_check = float(get_setting(Settings.LUMACORE_LAST_CHECK) or 0)
+    except (TypeError, ValueError):
+        last_check = 0.0
+
+    now = time.time()
+    use_cache = (
+        not force
+        and cached_latest
+        and (now - last_check) < _LC_VERSION_CHECK_INTERVAL
+    )
+
+    if use_cache:
+        latest = cached_latest
+        source = "cache"
+        checked_at = last_check
+    else:
+        fetched = _fetch_latest_release_tag()
+        if fetched:
+            latest = fetched
+            set_setting(Settings.LUMACORE_LATEST_VERSION, latest)
+            set_setting(Settings.LUMACORE_LAST_CHECK, str(now))
+            checked_at = now
+            source = "remote"
+        else:
+            # Network miss — fall back to whatever we already have.
+            latest = cached_latest
+            checked_at = last_check
+            source = "cache"
+
+    update_available = bool(installed and latest and installed != latest)
+    return {
+        "installed": installed,
+        "latest": latest,
+        "update_available": update_available,
+        "checked_at": checked_at,
+        "source": source,
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# Deactivate / remove LumaCore
+# ─────────────────────────────────────────────────────────────────────────
+#
+# Removes every file SteaMidra installs as part of LumaCore. Steam MUST be
+# fully closed before this runs because the DLLs are loaded into steam.exe
+# while it's running and the unlink will fail with "file in use" otherwise.
+# The web/CLI surface kills Steam first, then calls this; the function
+# itself only deletes files and reports what it did.
+
+_LC_REMOVE_PROCESSES = ("steam.exe", "steamservice.exe", "steamwebhelper.exe")
+
+
+def _force_close_steam(progress_callback: Optional[Callable[[str], None]] = None) -> None:
+    """Kill every Steam-side process that would hold a handle on LumaCore.dll
+    or dwmapi.dll. Best-effort — caller still surfaces success/failure based
+    on whether the unlink afterwards works.
+    """
+    import sys
+
+    if sys.platform != "win32":
+        return
+    try:
+        from sff.processes import is_proc_running
+    except Exception:
+        is_proc_running = None  # type: ignore
+
+    for name in _LC_REMOVE_PROCESSES:
+        try:
+            subprocess.run(
+                ["taskkill", "/F", "/IM", name],
+                capture_output=True,
+                timeout=10,
+                creationflags=subprocess.CREATE_NO_WINDOW,
+            )
+            _progress(f"Stopped {name}", progress_callback)
+        except (FileNotFoundError, OSError, subprocess.TimeoutExpired) as exc:
+            logger.debug("taskkill on %s failed: %s", name, exc)
+
+    # Give the loader a moment to fully release file handles.
+    import time
+    for _ in range(20):
+        time.sleep(0.25)
+        if is_proc_running is None:
+            break
+        any_alive = False
+        for name in _LC_REMOVE_PROCESSES:
+            try:
+                if is_proc_running(name):
+                    any_alive = True
+                    break
+            except Exception:
+                pass
+        if not any_alive:
+            break
+
+
+def deactivate_lumacore(
+    steam_path: Path,
+    progress_callback: Optional[Callable[[str], None]] = None,
+) -> tuple[bool, str]:
+    """Close Steam, delete LumaCore.dll / dwmapi.dll / lcoverlay.dll, clear
+    the installed-version setting. Idempotent — running twice on a clean
+    install reports "nothing to remove" instead of failing.
+
+    Returns (ok, message). ok is True when no DLL remains on disk after the
+    sweep (whether anything was deleted or not).
+    """
+    from sff.storage.settings import set_setting
+    from sff.structs import Settings
+
+    _progress("Closing Steam...", progress_callback)
+    _force_close_steam(progress_callback)
+
+    removed = 0
+    failures: list[str] = []
+    for subdir, name in _LC_RESET_FILES:
+        target = (steam_path / subdir / name) if subdir else (steam_path / name)
+        if not target.exists():
+            continue
+        path_label = f"{subdir}/{name}" if subdir else name
+        try:
+            target.unlink()
+            removed += 1
+            _progress(f"Removed {path_label}", progress_callback)
+        except OSError as exc:
+            failures.append(f"{path_label} ({exc})")
+            logger.warning("Failed to remove %s: %s", target, exc)
+
+    # Clear the cached install version so check_for_lumacore_update reports
+    # accurately on the next launch.
+    try:
+        set_setting(Settings.LUMACORE_INSTALLED_VERSION, "")
+    except Exception:
+        pass
+
+    if failures:
+        msg = (
+            f"Removed {removed} file(s); could not remove: "
+            + ", ".join(failures)
+            + ". Close Steam fully and try again, or delete the files manually."
+        )
+        _progress(msg, progress_callback)
+        return False, msg
+
+    if removed == 0:
+        msg = "LumaCore was not installed in this Steam folder; nothing to remove."
+        _progress(msg, progress_callback)
+        return True, msg
+
+    msg = f"LumaCore deactivated. Removed {removed} file(s)."
+    _progress(msg, progress_callback)
     return True, msg

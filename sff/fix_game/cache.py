@@ -109,7 +109,7 @@ class FixGameCache:
         │   ├── steam_api64.dll
         │   ├── steamclient.dll
         │   ├── steamclient64.dll
-        │   ├── steamclient_loader_x32.exe
+        │   ├── steamclient_loader_x86.exe
         │   ├── steamclient_loader_x64.exe
         │   └── ...
         ├── apps/               # per-game cached info

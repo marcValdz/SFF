@@ -50,6 +50,25 @@ def install_lua_to_steam(steam_path, app_id, lua_source_path):
         return False
 
 
+def _detect_manifest_appid_and_gid(manifest_path):
+    """Pull the leading numeric prefix and trailing manifest gid from a
+    canonical `<appid>_<manifest_id>.manifest` filename.
+
+    Returns (appid, manifest_gid) as strings, or (None, None) when the
+    filename does not match the pattern (e.g. user-renamed files).
+    """
+    try:
+        stem = manifest_path.stem
+        if "_" not in stem:
+            return None, None
+        head, _, tail = stem.partition("_")
+        if not head.isdigit() or not tail.isdigit():
+            return None, None
+        return head, tail
+    except Exception:
+        return None, None
+
+
 def sync_manifest_to_config_depotcache(steam_path, manifest_path):
     if not manifest_path.exists():
         return False
@@ -60,6 +79,11 @@ def sync_manifest_to_config_depotcache(steam_path, manifest_path):
         if dest != manifest_path:
             shutil.copy2(manifest_path, dest)
             logger.debug("Synced manifest to config/depotcache: %s", dest.name)
+        # The manifest is already in the staging dir under <sff_data>/manifests/
+        # because the upstream download path writes there before staging into
+        # depotcache. The watcher uses that staging copy directly when Steam
+        # uninstalls the game and wipes depotcache, so no extra backup step is
+        # needed here.
         return True
     except OSError as e:
         logger.debug("Could not sync manifest to config/depotcache: %s", e)
@@ -73,6 +97,15 @@ def remove_lua_from_steam(steam_path, app_id: str | int):
         if dest_file.exists():
             dest_file.unlink()
             logger.info("Removed LUA from Steam config: %s", dest_file)
+        # Also sweep stray <steam>/config/<app_id>.lua files. A bug in the
+        # 6.2.4 download path landed the source lua next to stplug-in/
+        # before install_lua_to_steam copied it into stplug-in/. The fix
+        # routes downloads to saved_lua/ instead, but existing user
+        # installs may still carry the stray; clean them on every remove.
+        stray = steam_path / "config" / f"{app_id}.lua"
+        if stray.exists():
+            stray.unlink()
+            logger.info("Removed stray Steam config LUA: %s", stray)
         return True
     except OSError as e:
         logger.warning("Could not remove LUA from Steam config: %s", e)

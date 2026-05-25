@@ -139,6 +139,24 @@ class SFFMainWindow(QMainWindow):
         self._current_theme = _saved_theme if (_saved_theme and _saved_theme in THEMES) else "dark"
         self._music_muted = False
         self._last_web_stdout_time = 0.0
+        # Batched log forwarding to the web UI. Each emit crosses the
+        # C++/JS boundary via QtWebChannel; under load (parallel
+        # manifest downloads, DDMod stdout, debug logging) the per-line
+        # emit was queueing tens of thousands of QString allocations
+        # that QtWebEngine retains in its renderer process for tens of
+        # seconds. Batched flush every 100ms means at most 10 messages
+        # per second cross the boundary regardless of producer rate;
+        # the DEBUG drop below 200 buffered lines keeps the burst
+        # bounded if a consumer (the Python-side worker) outpaces the
+        # 100ms flush.
+        self._web_log_buffer: list[str] = []
+        self._web_log_buffer_max = 200
+        self._web_log_dropped = 0
+        from PyQt6.QtCore import QTimer as _QTimer
+        self._web_log_flush_timer = _QTimer(self)
+        self._web_log_flush_timer.setInterval(100)
+        self._web_log_flush_timer.timeout.connect(self._flush_web_log_buffer)
+        self._web_log_flush_timer.start()
         self._game_list = []
         self._stream_emitter = StreamEmitter()
         self._log_window = GlobalLogWindow(self)
@@ -191,6 +209,33 @@ class SFFMainWindow(QMainWindow):
         )
         self._web_ui_active = True
         self._web_ui_loaded = False
+
+        # Manifest preservation watcher. The staging dir under
+        # <sff_data>/manifests/ already holds every manifest SteaMidra has
+        # downloaded. The watcher checks the two Steam-side caches that get
+        # cleared on game uninstall (<steam>/depotcache and
+        # <steam>/config/depotcache) and copies the manifest back from the
+        # staging dir if a file goes missing. No backup tree, no startup walk;
+        # the staging dir IS the backup.
+        try:
+            import threading as _threading
+
+            def _start_manifest_preserver():
+                try:
+                    from sff.manifests.preserver import start_watcher
+                    start_watcher(self.steam_path)
+                except Exception:
+                    # Watcher is best-effort. A failure here must not
+                    # block the GUI from showing.
+                    pass
+
+            _threading.Thread(
+                target=_start_manifest_preserver,
+                name="sff-manifest-preserver-init",
+                daemon=True,
+            ).start()
+        except Exception:
+            pass
         main_tab_widget = QWidget()
         main_tab_layout = QVBoxLayout(main_tab_widget)
         scroll = QScrollArea()
@@ -450,6 +495,9 @@ class SFFMainWindow(QMainWindow):
         )
         help_menu.addAction(T("Analytics dashboard")).triggered.connect(
             lambda: self._run_tool(lambda: self.ui.analytics_dashboard_menu())
+        )
+        help_menu.addAction(T("Dump Achievement Diagnostic")).triggered.connect(
+            self._dump_achievement_diagnostic
         )
         logs_action = menubar.addAction("Logs")
         logs_action.triggered.connect(self._show_log_window)
@@ -761,6 +809,49 @@ class SFFMainWindow(QMainWindow):
             lambda: self.ui.run_game_action_with_selection(choice, acf), label
         )
 
+    def _ask_steamauto_mode(self) -> str | None:
+        """Ask the user whether to run SteamAutoCrack in full mode
+        (Goldberg + Steamless, breaks Steam achievements) or Steamless-only
+        mode (just unpack SteamStub, achievement-safe).
+
+        Returns 'full', 'steamless_only', or None if the user cancels.
+
+        Honours the STEAMAUTO_DEFAULT_MODE setting: if set to "full" or
+        "steamless_only", returns that directly without prompting. Empty
+        string / unset means ask every time (the historical behaviour).
+        """
+        try:
+            from sff.storage.settings import get_setting
+            from sff.structs import Settings
+            saved = (get_setting(Settings.STEAMAUTO_DEFAULT_MODE) or "").strip()
+            if saved in ("full", "steamless_only"):
+                return saved
+        except Exception:
+            # Settings module not loaded yet, or the value is corrupt.
+            # Fall through to the picker so the user is never blocked.
+            pass
+
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Question)
+        box.setWindowTitle("SteamAutoCrack Mode")
+        box.setText("How would you like to run SteamAutoCrack?")
+        box.setInformativeText(
+            "Apply Both: install Goldberg emulator AND remove SteamStub. "
+            "Breaks Steam achievements (Goldberg replaces the Steam API).\n\n"
+            "Steamless only: just remove the SteamStub DRM wrapper. "
+            "Achievement-safe — keeps the Steam API intact."
+        )
+        full_btn = box.addButton("Apply Both (Goldberg + Steamless)", QMessageBox.ButtonRole.AcceptRole)
+        sl_btn = box.addButton("Steamless Only (achievement-safe)", QMessageBox.ButtonRole.ActionRole)
+        cancel_btn = box.addButton(QMessageBox.StandardButton.Cancel)
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked is full_btn:
+            return "full"
+        if clicked is sl_btn:
+            return "steamless_only"
+        return None
+
     def _run_steam_auto_gui(self):
         from sff.steamauto import get_steamauto_cli_path, run_steamauto
         if get_steamauto_cli_path() is None:
@@ -779,36 +870,50 @@ class SFFMainWindow(QMainWindow):
                 "Select a Steam game from the list or set a path for a game outside of Steam.",
             )
             return
-        if not self._confirm_achievement_break("SteamAutoCrack"):
+        mode = self._ask_steamauto_mode()
+        if mode is None:
+            return
+        # Steamless-only is achievement-safe, skip the warning. Full mode
+        # still goes through the standard "this will break achievements"
+        # confirmation.
+        if mode == "full" and not self._confirm_achievement_break("SteamAutoCrack"):
             return
         game_path = acf.path
         app_id = acf.app_id or "0"
         def _job():
-            run_steamauto(game_path, app_id, print_func=print)
-        self._start_worker(_job, label="SteamAutoCrack")
+            run_steamauto(game_path, app_id, mode=mode, print_func=print)
+        self._start_worker(_job, label=f"SteamAutoCrack ({mode})")
 
-    def _run_steam_auto_with_acf(self, acf):
-        """Web UI entry point — ACF already resolved, runs on main thread via _start_worker."""
+    def _run_steam_auto_with_acf(self, acf, mode: str | None = None):
+        """Web UI entry point — ACF already resolved, runs on main thread via _start_worker.
+
+        mode arg lets the Web UI pre-pick the mode after its own dialog.
+        When None (legacy callers), this falls back to the Qt mode picker.
+        """
         import json
         from sff.steamauto import run_steamauto
+        if mode is None:
+            mode = self._ask_steamauto_mode()
+            if mode is None:
+                return
         # The web UI shows its own confirmation dialog before calling here, so we
         # set _skip_next_achievement_warn from web_bridge to suppress the Qt prompt
         # and avoid double-warning. Classic UI calls _run_steam_auto_gui instead.
-        if not getattr(self, '_skip_next_achievement_warn', False):
+        if mode == "full" and not getattr(self, '_skip_next_achievement_warn', False):
             if not self._confirm_achievement_break("SteamAutoCrack"):
                 return
         self._skip_next_achievement_warn = False
         game_path = acf.path
         app_id = acf.app_id or "0"
         def _job():
-            run_steamauto(game_path, app_id, print_func=print)
+            run_steamauto(game_path, app_id, mode=mode, print_func=print)
         def _done():
             if hasattr(self, '_web_bridge') and self._web_bridge:
                 self._web_bridge.task_finished.emit(json.dumps({
                     "task": "steam_auto", "success": True,
-                    "message": "SteamAutoCrack completed"
+                    "message": f"SteamAutoCrack ({mode}) completed"
                 }))
-        self._start_worker(_job, label="SteamAutoCrack", on_done=_done)
+        self._start_worker(_job, label=f"SteamAutoCrack ({mode})", on_done=_done)
 
     def _run_tool(self, func):
         label = getattr(func, "__name__", "tool")
@@ -842,41 +947,101 @@ class SFFMainWindow(QMainWindow):
     # ── Log forwarding to web UI ────────────────────────────────
 
     def _forward_log_to_web(self, levelno: int, html: str):
-        """Forward log records to the web bridge so the web UI log panel shows them."""
+        """Forward log records to the web bridge so the web UI log panel shows them.
+
+        Buffered. The actual emit happens in `_flush_web_log_buffer`
+        on a 100ms timer so a producer firing thousands of records
+        per second cannot overwhelm QtWebEngine's renderer process.
+        """
         if not getattr(self, '_web_ui_active', True):
             return
-        if hasattr(self, '_web_bridge') and self._web_bridge:
-            import logging
+        if not (hasattr(self, '_web_bridge') and self._web_bridge):
+            return
+        import logging
+        if levelno <= logging.DEBUG:
+            lvl = 'DEBU'
+        elif levelno <= logging.INFO:
             lvl = 'INFO'
-            if levelno <= logging.DEBUG:
-                lvl = 'DEBU'
-            elif levelno <= logging.INFO:
-                lvl = 'INFO'
-            elif levelno <= logging.WARNING:
-                lvl = 'WARN'
-            else:
-                lvl = 'ERRO'
-            # Strip HTML tags for the web UI (it applies its own formatting)
-            import re
-            text = re.sub(r'<[^>]+>', '', html).strip()
-            # Remove the leading HH:MM:SS timestamp already embedded by QtLogHandler
-            # to avoid double-timestamps when the JS log panel adds its own.
-            text = re.sub(r'^\d{2}:\d{2}:\d{2}\s*', '', text)
-            self._web_bridge.log_message.emit(text)
+        elif levelno <= logging.WARNING:
+            lvl = 'WARN'
+        else:
+            lvl = 'ERRO'
+        # Strip HTML tags for the web UI (it applies its own formatting)
+        import re
+        text = re.sub(r'<[^>]+>', '', html).strip()
+        # Remove the leading HH:MM:SS timestamp already embedded by QtLogHandler
+        # to avoid double-timestamps when the JS log panel adds its own.
+        text = re.sub(r'^\d{2}:\d{2}:\d{2}\s*', '', text)
+        if not text:
+            return
+        # Drop DEBUG lines first when the buffer is hot — debug noise
+        # during parallel manifest downloads is the main offender and
+        # the user can re-enable verbose logging from the log panel
+        # itself if they need it.
+        if lvl == 'DEBU' and len(self._web_log_buffer) > self._web_log_buffer_max // 2:
+            self._web_log_dropped += 1
+            return
+        if len(self._web_log_buffer) >= self._web_log_buffer_max:
+            self._web_log_dropped += 1
+            return
+        self._web_log_buffer.append(f'[{lvl}] {text}')
 
     def _forward_stdout_to_web(self, text: str):
-        """Forward _stream_emitter stdout lines to the web UI log panel."""
+        """Forward _stream_emitter stdout lines to the web UI log panel.
+
+        Buffered. Same flush path as `_forward_log_to_web`.
+        """
         if not getattr(self, '_web_ui_active', True):
             return
-        import time as _time
-        now = _time.monotonic()
-        if now - self._last_web_stdout_time < 0.05:
+        if not (hasattr(self, '_web_bridge') and self._web_bridge):
             return
-        self._last_web_stdout_time = now
-        if hasattr(self, '_web_bridge') and self._web_bridge:
-            text = _ANSI_RE.sub("", text).strip()
-            if text:
-                self._web_bridge.log_message.emit(f'[INFO] {text}')
+        text = _ANSI_RE.sub("", text).strip()
+        if not text:
+            return
+        if len(self._web_log_buffer) >= self._web_log_buffer_max:
+            self._web_log_dropped += 1
+            return
+        self._web_log_buffer.append(f'[INFO] {text}')
+
+    def _flush_web_log_buffer(self):
+        """Drain the buffered log lines onto the QtWebChannel.
+
+        At most one emit per timer tick (100ms) and the payload is
+        joined with newlines so the JS side does one DOM batch
+        insert per tick, not per line.
+        """
+        if not getattr(self, '_web_ui_active', True):
+            self._web_log_buffer.clear()
+            return
+        if not (hasattr(self, '_web_bridge') and self._web_bridge):
+            return
+        if not self._web_log_buffer and not self._web_log_dropped:
+            return
+        if self._web_log_dropped > 0 and self._web_log_buffer:
+            # Surface dropped-lines count once per flush so the user
+            # knows logging was throttled. Do not amplify under load:
+            # the dropped marker counts towards the buffer cap on
+            # the next tick.
+            dropped = self._web_log_dropped
+            self._web_log_dropped = 0
+            try:
+                self._web_log_buffer.append(
+                    f'[WARN] (web log batch dropped {dropped} line(s) — verbose logging is throttled)'
+                )
+            except Exception:
+                pass
+        try:
+            payload = '\n'.join(self._web_log_buffer)
+        except Exception:
+            payload = ''
+        self._web_log_buffer.clear()
+        if payload:
+            try:
+                self._web_bridge.log_message.emit(payload)
+            except Exception:
+                # Web bridge tore down between buffer fill and flush;
+                # next tick will be a no-op.
+                pass
 
     # ── Music mute ───────────────────────────────────────────────
 
@@ -1078,17 +1243,23 @@ class SFFMainWindow(QMainWindow):
         self.close()
 
     def closeEvent(self, event):
-        # Read live from settings so toggling the option in Settings UI
-        # takes effect without restart. Default OFF — closing actually
-        # quits, matching the behaviour Windows users expect from the
-        # X button. Power users who want close-to-tray can enable it.
+        # Read live so Settings toggles take effect without restart.
+        # Default ON: X button hides to tray. The user can flip the
+        # CLOSE_TO_TRAY checkbox in Settings to make X quit instead.
+        # Treat missing / empty / explicit-True values as ON; only
+        # "False" / "false" / "0" disable tray behaviour.
         from sff.storage.settings import get_setting
         from sff.structs import Settings as _S
         try:
-            close_to_tray = bool(get_setting(_S.CLOSE_TO_TRAY))
+            raw = get_setting(_S.CLOSE_TO_TRAY)
         except Exception:
-            close_to_tray = False
-
+            raw = None
+        if raw is None or raw == "":
+            close_to_tray = True
+        elif isinstance(raw, bool):
+            close_to_tray = raw
+        else:
+            close_to_tray = str(raw).strip().lower() not in ("false", "0", "no", "off")
         if (
             self._tray is not None
             and self._tray.minimize_to_tray
@@ -1103,8 +1274,11 @@ class SFFMainWindow(QMainWindow):
                     "SteaMidra is running in the system tray. Click the ^ arrow near the clock to find it.",
                 )
         else:
-            self._save_watcher_timer.stop()
             event.accept()
+            if not getattr(self, "_quitting", False):
+                self._quitting = True
+                self.force_quit()
+                QApplication.instance().quit()
 
     # ── Background save watcher ──────────────────────────────────
 
@@ -1196,7 +1370,10 @@ class SFFMainWindow(QMainWindow):
             remote_dest = cfg.get('remote_dest', '')
             if not rclone_exe:
                 from sff.utils import root_folder
-                _bundled = root_folder() / "third_party" / "rclone" / ("rclone.exe" if _sys.platform == "win32" else "rclone")
+                # Use the platform-aware folder: rclone (Windows) vs rclone_linux (Linux).
+                _bundle_dir = "rclone" if _sys.platform == "win32" else "rclone_linux"
+                _bundle_name = "rclone.exe" if _sys.platform == "win32" else "rclone"
+                _bundled = root_folder() / "third_party" / _bundle_dir / _bundle_name
                 if _bundled.exists():
                     rclone_exe = str(_bundled)
             if not rclone_exe or not remote_dest:
@@ -1255,3 +1432,36 @@ class SFFMainWindow(QMainWindow):
             f"SteaMidra\nVersion {VERSION}\n\n"
             "https://github.com/Midrags/SFF/releases",
         )
+
+    def _dump_achievement_diagnostic(self):
+        """A16: read the LumaCore achievement diagnostic ring and surface
+        it in a QMessageBox. LumaCore writes the file on detach, so a
+        running session may see it empty until Steam restarts."""
+        try:
+            from sff.utils import sff_data_dir
+            path = sff_data_dir() / "lumacore_diag.txt"
+            if not path.exists():
+                QMessageBox.information(
+                    self,
+                    T("Dump Achievement Diagnostic"),
+                    T("No diagnostic captured yet (LumaCore writes on detach)"),
+                )
+                return
+            data = path.read_bytes()
+            tail = data[-16384:] if len(data) > 16384 else data
+            text = tail.decode("utf-8", errors="replace") or T(
+                "No diagnostic captured yet (LumaCore writes on detach)"
+            )
+            box = QMessageBox(self)
+            box.setWindowTitle(T("Dump Achievement Diagnostic"))
+            box.setText(f"{path}")
+            box.setDetailedText(text)
+            box.setStandardButtons(QMessageBox.StandardButton.Ok)
+            box.exec()
+        except Exception as exc:
+            logger.exception("dump achievement diagnostic failed: %s", exc)
+            QMessageBox.warning(
+                self,
+                T("Dump Achievement Diagnostic"),
+                str(exc),
+            )

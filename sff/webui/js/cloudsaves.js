@@ -367,6 +367,24 @@ window.CloudSaves = (function() {
             allSavesScanBtn.addEventListener('click', _scanAllSaveLocations);
         }
 
+        // 6.2.4: Custom save path per-game
+        var customBrowse = document.getElementById('custom-save-browse');
+        if (customBrowse) {
+            customBrowse.addEventListener('click', function() {
+                Bridge.callSync('open_file_dialog', function(path) {
+                    if (path) {
+                        var inp = document.getElementById('custom-save-path');
+                        if (inp) inp.value = path;
+                    }
+                });
+            });
+        }
+        var customAdd = document.getElementById('custom-save-add');
+        if (customAdd) {
+            customAdd.addEventListener('click', _addCustomSavePath);
+        }
+        _renderCustomSavePaths();
+
         // All Save Locations — backup destination browse
         var allSavesDestBrowse = document.getElementById('all-saves-dest-browse');
         if (allSavesDestBrowse) {
@@ -871,6 +889,85 @@ window.CloudSaves = (function() {
         }
         Bridge.call('restore_save_location', JSON.stringify(restoreEntry));
         Components.showToast('info', 'Restoring...');
+    }
+
+    function _addCustomSavePath() {
+        var appIdInp = document.getElementById('custom-save-appid');
+        var pathInp = document.getElementById('custom-save-path');
+        var appId = appIdInp ? appIdInp.value.trim() : '';
+        var path = pathInp ? pathInp.value.trim() : '';
+        if (!appId || !/^\d+$/.test(appId)) {
+            Components.showToast('warning', 'Enter a numeric App ID');
+            return;
+        }
+        if (!path) {
+            Components.showToast('warning', 'Choose a save folder first');
+            return;
+        }
+        Bridge.callWithCallback('set_custom_save_path', appId, path, function(result) {
+            try {
+                var data = JSON.parse(result || '{}');
+                if (data.ok) {
+                    if (appIdInp) appIdInp.value = '';
+                    if (pathInp) pathInp.value = '';
+                    Components.showToast('success', 'Saved. Next scan will pick it up.');
+                    _renderCustomSavePaths();
+                } else {
+                    Components.showToast('error', data.error || 'Failed to save path');
+                }
+            } catch (e) {
+                Components.showToast('error', 'Failed to save path');
+            }
+        });
+    }
+
+    function _removeCustomSavePath(appId) {
+        Bridge.callWithCallback('set_custom_save_path', appId, '', function(result) {
+            try {
+                var data = JSON.parse(result || '{}');
+                if (data.ok) {
+                    Components.showToast('success', 'Removed.');
+                    _renderCustomSavePaths();
+                } else {
+                    Components.showToast('error', data.error || 'Failed to remove path');
+                }
+            } catch (e) {
+                Components.showToast('error', 'Failed to remove path');
+            }
+        });
+    }
+
+    function _renderCustomSavePaths() {
+        var listEl = document.getElementById('custom-save-list');
+        if (!listEl) return;
+        Bridge.callWithCallback('get_custom_save_paths', function(json) {
+            var mapping = {};
+            try { mapping = JSON.parse(json || '{}') || {}; } catch (e) { mapping = {}; }
+            var keys = Object.keys(mapping);
+            if (keys.length === 0) {
+                listEl.innerHTML = '<p class="section-desc" style="margin:0;opacity:0.7;">No custom save paths registered yet.</p>';
+                return;
+            }
+            keys.sort();
+            var rows = keys.map(function(k) {
+                var safePath = String(mapping[k] || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+                var safeId = String(k).replace(/[^0-9]/g, '');
+                return '<tr><td style="padding:4px 8px;font-family:monospace;">' + safeId + '</td>'
+                    + '<td style="padding:4px 8px;word-break:break-all;">' + safePath + '</td>'
+                    + '<td style="padding:4px 8px;text-align:right;"><button class="btn btn-sm" data-remove-appid="' + safeId + '">Remove</button></td></tr>';
+            }).join('');
+            listEl.innerHTML = '<table style="width:100%;border-collapse:collapse;"><thead><tr>'
+                + '<th style="text-align:left;padding:4px 8px;">App ID</th>'
+                + '<th style="text-align:left;padding:4px 8px;">Save Folder</th>'
+                + '<th style="padding:4px 8px;"></th>'
+                + '</tr></thead><tbody>' + rows + '</tbody></table>';
+            listEl.querySelectorAll('button[data-remove-appid]').forEach(function(btn) {
+                btn.addEventListener('click', function() {
+                    var id = this.getAttribute('data-remove-appid');
+                    if (id) _removeCustomSavePath(id);
+                });
+            });
+        });
     }
 
     return {

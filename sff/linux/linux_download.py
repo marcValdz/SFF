@@ -43,8 +43,15 @@ def _parse_manifest_ids(lua_text: str) -> dict:
 
 
 def _get_manifests_from_staging() -> dict:
-    staging = Path.cwd() / "manifests"
-    result = {}
+    # Walk the canonical staging dir (writable user-data root). The old
+    # code used Path.cwd() which is wrong on AppImage launches and on
+    # Web UI workers, so the manifests the provider just dumped were
+    # silently invisible to the DDMod forwarder, _build_game_data
+    # returned an empty manifests dict, and DDMod fell back to "fetch
+    # from Steam CDN anonymously" -> 401.
+    from sff.utils import manifests_staging_dir
+    staging = manifests_staging_dir()
+    result: dict = {}
     if not staging.exists():
         return result
     for f in staging.glob("*.manifest"):

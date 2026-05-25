@@ -82,6 +82,7 @@ add_library(LumaCore SHARED
     utils/LuaLoader.cpp
     utils/VehUtil.cpp
     utils/DirWatch.cpp
+    utils/Diagnostics.cpp
 
     # Per-category hook modules
     hooks/CoreLoader.cpp
@@ -89,7 +90,7 @@ add_library(LumaCore SHARED
     hooks/IPCBus.cpp
     hooks/CmdUser.cpp
     hooks/CmdUtils.cpp
-    # hooks/KeyValues.cpp  # disabled: KeyValues::Install() not called
+    hooks/KeyValues.cpp
     hooks/ManifestBind.cpp
     hooks/RuntimeCapture.cpp
     hooks/PacketRouter.cpp
@@ -122,8 +123,12 @@ target_link_libraries(LumaCore PRIVATE
 )
 
 # Logging is compiled in only for Debug; Release reduces LOG_* to no-ops.
+# LUMACORE_DIAGNOSTICS_ENABLED is independent: the achievement diagnostic
+# ring buffer ships in BOTH Debug and Release so users hitting the Wukong
+# bleed on a Release DLL can dump the ring from the SteaMidra Help menu.
 target_compile_definitions(LumaCore PRIVATE
     $<$<CONFIG:Debug>:LUMACORE_LOGGING_ENABLED>
+    LUMACORE_DIAGNOSTICS_ENABLED
 )
 
 # ---------------------------------------------------------------------------

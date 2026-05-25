@@ -701,6 +701,72 @@ def scan_all_save_locations(steam_path=None, steam32_id=None):
         except Exception as e:
             logger.warning("scan %s: %s", loc_name, e)
 
+    # 6.2.4: user-defined custom save paths. Some games store saves
+    # outside the Steam userdata tree and the standard emu folders, like
+    # Documents\My Games\<title>\ or %APPDATA%\<publisher>\<game>\. The
+    # Cloud Saves UI lets users add a path per app id; the scan picks
+    # those up here so backup / restore works without modifying the
+    # source-of-truth lists. Stored as JSON {"<app_id>": "<path>"}.
+    try:
+        from sff.storage.settings import get_setting as _get_setting
+        from sff.structs import Settings as _Settings
+        import json as _json
+        raw = _get_setting(_Settings.CLOUD_CUSTOM_SAVE_PATHS) or ""
+        custom_map = {}
+        if raw:
+            try:
+                parsed = _json.loads(raw)
+                if isinstance(parsed, dict):
+                    custom_map = parsed
+            except Exception:
+                custom_map = {}
+        for app_id_str, raw_path in custom_map.items():
+            if not raw_path:
+                continue
+            try:
+                src = Path(raw_path).expanduser()
+            except Exception:
+                continue
+            if not src.exists() or not src.is_dir():
+                continue
+            files = [f for f in src.rglob("*") if f.is_file()]
+            if not files:
+                continue
+            try:
+                app_id_int = int(app_id_str)
+            except Exception:
+                app_id_int = None
+            game_name = src.name
+            try:
+                from sff.storage.vdf import get_steam_libs as _libs, vdf_load as _vdf
+                if app_id_int and steam_path:
+                    steam_root = Path(steam_path)
+                    libs = _libs(steam_root)
+                    if steam_root not in libs:
+                        libs = [steam_root] + list(libs)
+                    for lib in libs:
+                        acf = lib / "steamapps" / f"appmanifest_{app_id_int}.acf"
+                        if acf.exists():
+                            data = _vdf(acf)
+                            n = data.get("AppState", {}).get("name", "")
+                            if n:
+                                game_name = n
+                                break
+            except Exception:
+                pass
+            label = f"{app_id_int} - {game_name}" if app_id_int else game_name
+            results.append({
+                "location": "Custom Path",
+                "folder_name": src.name,
+                "app_id": app_id_int,
+                "game_name": game_name,
+                "label": label,
+                "source_path": str(src),
+                "file_count": len(files),
+            })
+    except Exception as e:
+        logger.warning("scan custom save paths: %s", e)
+
     return results
 
 

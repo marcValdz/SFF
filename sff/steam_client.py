@@ -55,7 +55,28 @@ def _get_product_info(client, app_ids):
             print("Logging in anonymously...", end="", flush=True)
             client.anonymous_login()
             print(" Done!")
-        last_error = None
+        last_error: Exception | None = None
+        # Steam can drop the WebSocket mid-fetch with anything from
+        # gevent.Timeout to socket.timeout, ConnectionResetError, EOFError,
+        # or steam.client's own SteamError. Treat them all as the same
+        # transient failure and retry instead of letting the exception
+        # bubble up and crash the worker thread.
+        import socket
+        try:
+            from steam.exceptions import SteamError  # type: ignore
+        except Exception:
+            SteamError = ()  # type: ignore[assignment]
+        transient = (
+            gevent.Timeout,
+            socket.timeout,
+            ConnectionResetError,
+            ConnectionAbortedError,
+            ConnectionError,
+            EOFError,
+            OSError,
+        )
+        if SteamError:
+            transient = transient + (SteamError,)  # type: ignore[assignment]
         for attempt in range(1, _MAX_APP_INFO_RETRIES + 1):
             try:
                 print("Getting app info...")
@@ -64,25 +85,33 @@ def _get_product_info(client, app_ids):
                 info = client.get_product_info(  # pyright: ignore[reportUnknownMemberType]
                     app_ids
                 )
-                # only none when app_ids is empty, which never happens
-                assert info is not None
+                if info is None:
+                    raise gevent.Timeout(None, "get_product_info returned None")
                 logger.debug(f"Product info request took: {time.time() - start}s")
                 return ProductInfo(info)
-            except gevent.Timeout as e:
+            except transient as e:
                 last_error = e
+                logger.debug(f"App info attempt {attempt} hit {type(e).__name__}: {e}")
                 if attempt < _MAX_APP_INFO_RETRIES:
                     print(f"Request timed out. Trying again ({attempt}/{_MAX_APP_INFO_RETRIES})...")
                     try:
                         client.anonymous_login()
-                    except RuntimeError:
+                    except Exception:
                         pass
                     time.sleep(2)
-                else:
-                    print(
-                        "Request timed out after several attempts. "
-                        "Check your internet connection and Steam status, then try again later."
-                    )
-                    raise
+                    continue
+                print(
+                    "Request timed out after several attempts. "
+                    "Check your internet connection and Steam status, then try again later."
+                )
+                # Return an empty ProductInfo instead of raising so the
+                # caller's worker thread doesn't crash. The bridge will
+                # surface "no game info" via its existing empty-result path.
+                return ProductInfo({"apps": {}, "packages": {}})
+        # All retries exhausted without an exception we recognised.
+        if last_error is not None:
+            logger.warning(f"App info gave up after {_MAX_APP_INFO_RETRIES} attempts: {last_error}")
+        return ProductInfo({"apps": {}, "packages": {}})
 
 
 class SteamInfoProvider:

@@ -259,6 +259,36 @@ a:hover { text-decoration: underline; }
     font-weight: 600;
 }
 
+/* Home page LC shortcut row — sits between the LumaCore notice and Select Game.
+   Keeps the two most-used Quick Tools shortcuts above the fold so users do not
+   have to scroll past the game picker to reach them. */
+.home-quick-row {
+    display: flex;
+    gap: 12px;
+    margin: 0 0 18px 0;
+    flex-wrap: wrap;
+}
+
+.home-quick-row .action-card {
+    flex: 1 1 220px;
+    min-height: 64px;
+    flex-direction: row;
+    align-items: center;
+    justify-content: center;
+    gap: 10px;
+    padding: 14px 18px;
+}
+
+.home-quick-row .action-card .action-icon {
+    width: 22px;
+    height: 22px;
+    min-width: 22px;
+}
+
+.home-quick-row .action-card .action-title {
+    font-size: 14px;
+}
+
 .action-desc.safe-achievements {
     opacity: 1;
     color: #4caf50;
@@ -1525,6 +1555,11 @@ body.platform-win32 .platform-win { display: flex; }
 body.platform-win32 .settings-section.platform-win { display: block; }
 body.platform-linux .platform-win { display: none; }
 
+.platform-linux { display: none; }
+body.platform-linux .platform-linux { display: flex; }
+body.platform-linux .settings-section.platform-linux { display: block; }
+body.platform-win32 .platform-linux { display: none; }
+
 /* ── Scrollbar ──────────────────────────────────────── */
 
 ::-webkit-scrollbar {
@@ -1543,3 +1578,115 @@ body.platform-linux .platform-win { display: none; }
 ::-webkit-scrollbar-thumb:hover {
     background: var(--btn-hover);
 }
+
+/* ── A5 Update button spinner ───────────────────────── */
+/* Tiny inline SVG spinner used by the Settings Update button.
+   Reuses the existing @keyframes spin in animations.css. */
+.spinner {
+    display: inline-block;
+    vertical-align: middle;
+    animation: spin 0.8s linear infinite;
+    color: currentColor;
+}
+
+
+/* ── A12 Bulk Import (Folder Scan + Drag-and-Drop) ──────────────── */
+
+.bulk-drop-zone {
+    margin-top: 12px;
+    padding: 24px 18px;
+    border: 2px dashed var(--border, rgba(255,255,255,0.25));
+    border-radius: 10px;
+    background: var(--surface2, rgba(255,255,255,0.04));
+    color: var(--fg);
+    text-align: center;
+    font-size: 13px;
+    transition: border-color 0.15s ease, background 0.15s ease;
+    user-select: none;
+}
+
+.bulk-drop-zone .bulk-drop-zone-icon {
+    display: block;
+    font-size: 28px;
+    line-height: 1;
+    opacity: 0.6;
+    margin-bottom: 6px;
+}
+
+.bulk-drop-zone .bulk-drop-zone-text {
+    opacity: 0.85;
+}
+
+.bulk-drop-zone:hover,
+.bulk-drop-zone.bulk-drop-active {
+    border-color: var(--accent, #e94560);
+    background: rgba(233, 69, 96, 0.08);
+}
+
+.bulk-aggregate-progress {
+    margin-top: 14px;
+    padding: 10px 12px;
+    background: var(--card-bg, rgba(255,255,255,0.04));
+    border: 1px solid var(--border, rgba(255,255,255,0.12));
+    border-radius: 8px;
+}
+
+.bulk-aggregate-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    font-size: 12px;
+    margin-bottom: 6px;
+}
+
+.bulk-aggregate-track {
+    width: 100%;
+    height: 6px;
+    background: var(--border, rgba(255,255,255,0.12));
+    border-radius: 3px;
+    overflow: hidden;
+}
+
+.bulk-aggregate-fill {
+    height: 100%;
+    width: 0%;
+    background: var(--accent, #e94560);
+    transition: width 0.25s ease;
+}
+
+.bulk-results-panel {
+    margin-top: 14px;
+    padding: 12px 14px;
+    background: var(--card-bg, rgba(255,255,255,0.04));
+    border: 1px solid var(--border, rgba(255,255,255,0.12));
+    border-radius: 8px;
+}
+
+.bulk-results-title {
+    font-size: 13px;
+    font-weight: 600;
+    margin-bottom: 8px;
+    opacity: 0.85;
+}
+
+.bulk-results-list {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    max-height: 220px;
+    overflow-y: auto;
+    font-family: 'Cascadia Code', 'Fira Code', Consolas, monospace;
+    font-size: 11px;
+    line-height: 1.5;
+}
+
+.bulk-result-item {
+    padding: 3px 4px;
+    border-bottom: 1px solid var(--border, rgba(255,255,255,0.06));
+    word-break: break-all;
+}
+
+.bulk-result-item:last-child { border-bottom: none; }
+.bulk-result-ok { color: #4ade80; }
+.bulk-result-fail { color: #f87171; }
+.bulk-result-skipped { color: #f0c040; opacity: 0.85; }

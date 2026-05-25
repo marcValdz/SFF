@@ -86,7 +86,7 @@ logger.setLevel(logging.DEBUG)
 
 
 
-fh = logging.FileHandler("debug.log")
+fh = logging.FileHandler("debug.log", encoding="utf-8", errors="replace")
 
 fh.setFormatter(
 
@@ -138,7 +138,11 @@ def main(ui, args: argparse.Namespace):
 
     if ui.app_list_man:
 
-        logger.debug(f"Injection folder: {ui.app_list_man.applist_folder.resolve()}")
+        stplug = getattr(ui.app_list_man, "stplug_in", None)
+        if stplug is not None:
+            logger.debug(f"LumaCore stplug-in folder: {stplug.resolve()}")
+        else:
+            logger.debug(f"Injection manager: {type(ui.app_list_man).__name__}")
 
     elif ui.sls_man:
 

@@ -1,5 +1,12 @@
-// Hook KeyValues::ReadAsBinary — entry point for KV-tree manipulation.
-// Manifest depot patching is handled by ManifestBind::BuildDepotDependency.
+// LumaCore — Steam client hook layer for SteaMidra.
+// Copyright (c) 2025-2026 Midrag (https://github.com/Midrags).
+// Distributed under the GNU General Public License v3 or later.
+// See <https://www.gnu.org/licenses/> for the full license text.
+
+// Hook KeyValues::ReadAsBinary — the parser entry point Steam uses for KV
+// trees. Manifest depot patching lives in ManifestBind::BuildDepotDependency,
+// so this hook is currently observation-only: each fire feeds the keyvalue
+// category so triage on future KV regressions has a non-empty log to read.
 
 #include "KeyValues.h"
 #include "Macros.h"
@@ -7,57 +14,32 @@
 
 namespace {
 
-    HOOK_FUNC(ReadAsBinary, bool, KeyValues* root, void* buf, int depth,
-              bool textMode, void* symTable) {
-        bool ok = oReadAsBinary(root, buf, depth, textMode, symTable);
-        return ok;
+    LC_HOOK_DEF(ReadAsBinary, bool,
+                KeyValues* root, void* buf, int depth,
+                bool textMode, void* symTable)
+    {
+        LOG_KEYVALUECH_INFO("KeyValues::ReadAsBinary fire (root=0x{:X}, depth={}, textMode={})",
+                            reinterpret_cast<uintptr_t>(root), depth, textMode);
+        return oReadAsBinary(root, buf, depth, textMode, symTable);
     }
 
-    using FindOrCreateKey_t = KeyValues*(*)(KeyValues*, const char*, bool, KeyValues**);
-    FindOrCreateKey_t oFindOrCreateKey = nullptr;
+}
 
-    // ── KeyValuesSystem — symbol ↔ string (from vstdlib_s64.dll) ───
-
-    IKeyValuesSystem* GetKeyValuesSystem() {
-        static IKeyValuesSystem* sys = []() -> IKeyValuesSystem* {
-            HMODULE vstdlib = GetModuleHandleW(L"vstdlib_s64.dll");
-            if (!vstdlib) return nullptr;
-            auto pfn = (KeyValuesSystemSteam_t)GetProcAddress(vstdlib, "KeyValuesSystemSteam");
-            return pfn ? pfn() : nullptr;
-        }();
-        return sys;
-    }
-
-    const char* GetKeyName(int symbol) {
-        auto* sys = GetKeyValuesSystem();
-        auto name = sys->GetStringForSymbol(symbol);
-        LOG_KEYVALUE_TRACE("GetKeyName: symbol={} -> name={}", symbol, name);
-        return name ? name : nullptr;
-    }
-
-    KeyValues* KV_FindKey(KeyValues* parent, const char* name) {
-        return oFindOrCreateKey ? oFindOrCreateKey(parent, name, false, nullptr) : nullptr;
-    }
-
-} // anonymous namespace
-
-namespace KeyValues {
+namespace KVHooks {
 
     void Install() {
-        RESOLVE_EX_D(FindOrCreateKey, KeyValues_FindOrCreateKeySigs);
-        if (!oFindOrCreateKey) return;
-
-        HOOK_BEGIN();
-        INSTALL_HOOK_EX_D(ReadAsBinary, KeyValues_ReadAsBinarySigs);
-        HOOK_END();
+        LC_TX_OPEN();
+        LC_ATTACH_EX_D(ReadAsBinary, KeyValues_ReadAsBinarySigs);
+        LC_TX_COMMIT();
+        LOG_KEYVALUECH_INFO("KVHooks::Install: ReadAsBinary {}",
+                            oReadAsBinary ? "attached" : "pattern miss");
     }
 
     void Uninstall() {
-        if (!oReadAsBinary) return;
-        UNHOOK_BEGIN();
-        UNINSTALL_HOOK(ReadAsBinary);
-        UNHOOK_END();
-        oFindOrCreateKey = nullptr;
+        LC_TX_OPEN();
+        LC_DETACH(ReadAsBinary);
+        LC_TX_COMMIT();
+        LOG_KEYVALUECH_INFO("KVHooks::Uninstall: ReadAsBinary detached");
     }
 
-} // namespace KeyValues
+}

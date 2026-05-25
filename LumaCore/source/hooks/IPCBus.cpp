@@ -1,3 +1,8 @@
+// LumaCore — Steam client hook layer for SteaMidra.
+// Copyright (c) 2025-2026 Midrag (https://github.com/Midrags).
+// Distributed under the GNU General Public License v3 or later.
+// See <https://www.gnu.org/licenses/> for the full license text.
+
 #include "IPCBus.h"
 #include "CmdUser.h"
 #include "CmdUtils.h"
@@ -16,9 +21,8 @@ namespace {
         return oGetPipeClient ? oGetPipeClient(pServer, hSteamPipe) : nullptr;
     }
 
-    // ════════════════════════════════════════════════════════════════
-    //  Handler registry
-    // ════════════════════════════════════════════════════════════════
+    // ▌▌ LumaCore ▌ IPC ▌ Handler registry
+    // ▌▌
     using namespace IPCBus;
 
     static constexpr uint64 MakeHandlerKey(EIPCInterface iface, uint32 funcHash) {
@@ -32,16 +36,15 @@ namespace {
         return (it != g_Handlers.end()) ? &it->second : nullptr;
     }
 
-    // ════════════════════════════════════════════════════════════════
-    //  Main hook
-    // ════════════════════════════════════════════════════════════════
+    // ▌▌ LumaCore ▌ IPC ▌ Main hook
+    // ▌▌
     LC_HOOK_DEF(IPCProcessMessage, bool,
               void* pServer, HSteamPipe hSteamPipe,
               CUtlBuffer* pRead, CUtlBuffer* pWrite)
     {
         auto* pipe = GetPipe(pServer, hSteamPipe);
 
-        // ── Always log every incoming IPC, before any filter ────
+        // ▌ IPC ▌ Always log every incoming IPC, before any filter
         // Helps diagnose ticket-validation flows that may be silently
         // skipped by the pipe-handle filter below.
         if (pRead->TellPut() >= IPC_HEADER_SIZE) {
@@ -52,42 +55,51 @@ namespace {
             const int32 dumpN = rawSize > 32 ? 32 : rawSize;
             char tmp[4];
             preview.reserve(dumpN * 3);
-            for (int32 i = 0; i < dumpN; ++i) {
-                std::snprintf(tmp, sizeof(tmp), "%02X ", rawData[i]);
+            for (int32 idx = 0; idx < dumpN; ++idx) {
+                std::snprintf(tmp, sizeof(tmp), "%02X ", rawData[idx]);
                 preview.append(tmp);
             }
-            LOG_IPC_INFO("RAW IPC: cmd={} pipe=0x{:08X} size={} head[hex]={}",
+            LOG_IPCCH_INFO("RAW IPC: cmd={} pipe=0x{:08X} size={} head[hex]={}",
                          EIPCCommandName(rawCmd),
                          pipe ? pipe->m_hSteamPipe : 0u,
                          rawSize, preview);
         }
 
-        // ── Parse header, find handler ──────────────────────────
-        const IpcHandlerEntry* entry = nullptr;
+        // ▌ IPC ▌ Parse header, find handler
+        const IpcHandlerEntry* handlerEntry = nullptr;
+        // userStatsCall is true exactly when the parsed interface is
+        // IClientUserStats. Drives the SetUserStatsContext bracket
+        // around oIPCProcessMessage so the GetAppIDForCurrentPipe
+        // detour returns the real appid (not the 480 masquerade) for
+        // the duration of the IPC. Lobby / friends / controller /
+        // RemoteStorage paths leave the flag false and stay byte-
+        // identical to the existing 480 behaviour.
+        bool userStatsCall = false;
 
         if (pRead->TellPut() >= IPC_HEADER_SIZE) {
-            const uint8* data = pRead->Base();
-            const auto cmd = static_cast<EIPCCommand>(data[OFFSET_CMD]);
+            const uint8* pktData = pRead->Base();
+            const auto cmd = static_cast<EIPCCommand>(pktData[OFFSET_CMD]);
 
             if (cmd == EIPCCommand::Handshake) {
-                if (pipe) LOG_IPC_INFO("[Handshake]: {}", pipe->DebugString());
+                if (pipe) LOG_IPCCH_INFO("[Handshake]: {}", pipe->DebugString());
             } else if (cmd == EIPCCommand::InterfaceCall) {
                 // exclude InterfaceCall from steam
                 if (!pipe || (pipe->m_hSteamPipe & 0xFFFF) <= 2) {
-                    if (pipe) LOG_IPC_INFO("[InterfaceCall] from steam, pipe=0x{:08X} skip handler", pipe->m_hSteamPipe);
+                    if (pipe) LOG_IPCCH_INFO("[InterfaceCall] from steam, pipe=0x{:08X} skip handler", pipe->m_hSteamPipe);
                     return oIPCProcessMessage(pServer, hSteamPipe, pRead, pWrite);
                 }
-                const auto iface = static_cast<EIPCInterface>(data[OFFSET_INTERFACE_ID]);
-                const uint32 funcHash = *reinterpret_cast<const uint32*>(data + OFFSET_FUNC_HASH);
-                entry = FindHandler(iface, funcHash);
-                if (entry) {
-                    LOG_IPC_INFO("[InterfaceCall] {} {} realAppId={},AppId={}",
-                                  entry->name, pipe ? pipe->DebugString() : "pipe=null",
+                const auto iface = static_cast<EIPCInterface>(pktData[OFFSET_INTERFACE_ID]);
+                const uint32 funcHash = *reinterpret_cast<const uint32*>(pktData + OFFSET_FUNC_HASH);
+                userStatsCall = (iface == EIPCInterface::IClientUserStats);
+                handlerEntry = FindHandler(iface, funcHash);
+                if (handlerEntry) {
+                    LOG_IPCCH_INFO("[InterfaceCall] {} {} realAppId={},AppId={}",
+                                  handlerEntry->name, pipe ? pipe->DebugString() : "pipe=null",
                                   SteamCapture::ResolveAppId(),
                                   SteamCapture::GetAppIDForCurrentPipe()
                                 );
                 } else {
-                    LOG_IPC_INFO("[InterfaceCall(unhandled)]{}::0x{:08X} {} realAppId={},AppId={}",
+                    LOG_IPCCH_INFO("[InterfaceCall(unhandled)]{}::0x{:08X} {} realAppId={},AppId={}",
                                   EIPCInterfaceName(iface), funcHash,
                                   pipe ? pipe->DebugString() : "pipe=null",
                                   SteamCapture::ResolveAppId(),
@@ -95,24 +107,29 @@ namespace {
                                 );
                 }
             } else {
-                if (pipe) LOG_IPC_INFO("[{}] {}", EIPCCommandName(cmd), pipe->DebugString());
+                if (pipe) LOG_IPCCH_INFO("[{}] {}", EIPCCommandName(cmd), pipe->DebugString());
             }
         }
 
-        // ── Run original ────────────────────────────────────────
-        const bool result = oIPCProcessMessage(pServer, hSteamPipe, pRead, pWrite);
-        if (!result || !entry) return result;
+        // ▌ IPC ▌ Run original
+        // Scope is open only for IClientUserStats so the lobby /
+        // friends / controller / RemoteStorage pass-through that
+        // depends on the 480 masquerade stays byte-identical.
+        if (userStatsCall) SteamCapture::SetUserStatsContext(true);
+        const bool outcome = oIPCProcessMessage(pServer, hSteamPipe, pRead, pWrite);
+        if (userStatsCall) SteamCapture::SetUserStatsContext(false);
+        if (!outcome || !handlerEntry) return outcome;
 
         // Only run handlers for apps with configured depots.
         AppId_t appId = SteamCapture::ResolveAppId();
         if (!LuaLoader::HasDepot(appId)) {
-            LOG_IPC_INFO("{}: appId={} has no configured depot, skip handler {}",
-                entry->name, appId, pipe ? pipe->DebugString() : "pipe=null");
-            return result;
+            LOG_IPCCH_INFO("{}: appId={} has no configured depot, skip handler {}",
+                handlerEntry->name, appId, pipe ? pipe->DebugString() : "pipe=null");
+            return outcome;
         }
 
-        entry->handler(pipe, pRead, pWrite);
-        return result;
+        handlerEntry->handler(pipe, pRead, pWrite);
+        return outcome;
     }
 
 } // namespace
@@ -122,8 +139,8 @@ namespace IPCBus {
 
     void RegisterHandlers(const IpcHandlerEntry* entries, size_t count) {
         g_Handlers.reserve(g_Handlers.size() + count);
-        for (size_t i = 0; i < count; ++i)
-            g_Handlers.emplace(MakeHandlerKey(entries[i].interfaceID, entries[i].funcHash), entries[i]);
+        for (size_t idx = 0; idx < count; ++idx)
+            g_Handlers.emplace(MakeHandlerKey(entries[idx].interfaceID, entries[idx].funcHash), entries[idx]);
     }
 
     void Install() {
@@ -136,6 +153,9 @@ namespace IPCBus {
         LC_TX_OPEN();
         LC_ATTACH_D(IPCProcessMessage);
         LC_TX_COMMIT();
+
+        LOG_IPCCH_INFO("IPCBus: install complete, hook at 0x{:X}",
+                       reinterpret_cast<uintptr_t>(oIPCProcessMessage));
     }
 
     void Uninstall() {

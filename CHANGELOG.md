@@ -1,5 +1,65 @@
 # Changelog
 
+## 6.2.4
+
+### LumaCore — CD key bypass
+
+- Lua-tracked games no longer hit the legacy CD key prompt for keys Steam itself wants. Older titles like Wargame: Red Dragon used to refuse to launch because Steam asked for a key the user doesn't have. The new license layer answers `false` for `RequiresLegacyCDKey` on apps tracked by Lua, so the prompt never fires. The hook is byte-pattern only against `steamclient64.dll` so it never lands on the wrong target
+- DLC ownership / install / cloud checks deliberately stay out of the new hook. Steam already returns the right answer for Lua-tracked appids through the existing CheckAppOwnership patch
+
+### LumaCore — version checker + deactivate
+
+- Auto LC Setup modal now shows the installed LumaCore version next to the latest GitHub release. SteaMidra hits the GitHub releases API at most once every six hours and caches the answer, so the version line is instant on subsequent opens. A blue banner appears when an update is available
+- New "Deactivate LumaCore" button next to "Install LumaCore". Asks for confirmation, closes Steam plus steamwebhelper / steamservice, then removes `LumaCore.dll`, `dwmapi.dll`, and `bin/lcoverlay.dll`
+
+### Home page
+
+- Multiplayer Fix sits at the top alongside LC Online Fix and Auto LC Setup. The LumaCore notice mentions Multiplayer Fix as the LC-Online-Fix fallback when a game doesn't work
+- The duplicate LC Online Fix, Auto LC Setup, and Multiplayer Fix tiles in Quick Tools are gone. Those three live at the top now
+
+### SteamAutoCrack
+
+- The home page card no longer flatly says it breaks achievements. The label now reflects that SteamAutoCrack runs in either Steamless-only mode (achievement-safe) or Steamless + Goldberg mode, and the existing default-mode setting controls which one runs without re-prompting
+
+### Store / search
+
+- Common franchise abbreviations work in the search box. Typing `gta` finds Grand Theft Auto, `re` finds Resident Evil, `cod` Call of Duty, `rdr` Red Dead, `kh` Kingdom Hearts, `er` Elden Ring, `tf2` Team Fortress 2, `cs2` Counter-Strike 2, and so on. Full names still match the same way they did
+- Hubcap entries that aren't in Steam's catalog now merge into search results when a Hubcap key is configured. Delisted titles like classic Grand Theft Auto: San Andreas show up alongside the regular Steam hits instead of being silently dropped
+- Hubcap merge now alias-expands the user query before sending it to Hubcap. Typing "gta san andreas" used to send "gta san andreas" verbatim, which Hubcap matches as a substring against game names where the classic title is stored as "Grand Theft Auto: San Andreas" with no "GTA" anywhere. The merge step now also queries Hubcap with "grand theft auto san andreas" (and the matching expansion for re, cod, rdr, kh, er, wukong, all the other aliases) and dedupes results by appid, so abbreviated typing finally surfaces the delisted classics on Hubcap-keyed setups
+- Hubcap merge filters out macOS-only and Linux-only entries. Searching "grand theft auto san andreas" no longer shows the Mac port (appid 12250) alongside the Windows classic (12120) and the Definitive Edition (1547000). Hubcap's API doesn't carry platform info, so each Hubcap-only candidate gets a tiny `appdetails?filters=platforms` lookup against Steam, cached for the lifetime of the process. Entries Steam can't resolve (delisted, no data) stay in the list so genuine classics aren't dropped
+- Oureveryday Lua now includes appid-only DLCs (the kind that don't ship their own depot). The downloader pulls `extended.listofdlc` from the game's app info and writes one `addappid(<dlc_id>)` line per entry under the keyed lines. LumaCore picks them up on the next license refresh, so the DLC unlocks without needing the user to add it manually
+
+### Achievements
+
+- Achievements now unlock for `-onlinefix` titles. The fake Spacewar (480) appid was leaking into the achievement IPC path and binding unlocks to the wrong app. The override is now scoped to `IClientUserStats` calls only, so achievements bind to the real game and lobby / friends / controller paths stay untouched
+- Wukong (`2358720`) and Resident Evil Requiem (`3764200`) achievement panels now render. The two spoof handlers were too strict and pass-through'd shapes that should have been spoofed, leaving the panels empty
+- `keyvalue.log`, `ipc.log`, and `license.log` were 0 bytes after a session. KVHooks, IPCBus, and LicenseHooks now each emit at least one entry per session
+- Restored the achievement handler to the last working baseline. The on-disk wipe of `<steam>/appcache/stats/UserGameStats_*` is gone, so legitimate local achievement state is no longer clobbered on Steam launch
+- Callback intercepts on UserStatsReceived and UserAchievementStored are gone; only the existing `AppLicensesChanged.m_bReloadAll → true` flip stays
+
+### Linux
+
+- Home page shows a Linux-specific notice instead of the Windows LumaCore-required banner. The notice explains LumaCore is Windows-only and points at SLSsteam + SLScheevo as the Linux equivalents, with a link to the new setup doc
+- New [docs/LINUX_SETUP.md](docs/LINUX_SETUP.md) walks through the Linux install path end to end: supported distros (CachyOS, Arch, Debian, Ubuntu, Fedora, Steam Deck Desktop Mode), what works and what's hidden, the SLSsteam + .NET 9 setup tool, the "restart Steam from inside SteaMidra so injection happens" gotcha, and a troubleshooting block for the most common failure modes
+- README adds a Linux quick-start section pointing at the same doc
+
+### Bulk lua downloader
+
+- `LumaCoreForWork/allgames/download_zips.py` (the bulk .lua downloader) no longer pegs the CPU. Rewritten on asyncio with HTTP/2 connection pooling, separate semaphores for network vs decompression (decompress capped at half the cpu count), and per-appid parallel source fetching so wall time per appid is `max(source1, source2)` instead of `source1 + source2`. The output directory is scanned once at startup instead of once per worker per appid. Tunable via `DZ_NET` / `DZ_CPU` / `DZ_TIMEOUT` env vars
+
+### LumaCore-required notice
+
+- Added a blue notice banner above the existing Steam-error-54 banner on the home page. It tells users that adding games to their Steam library and downloading them needs LumaCore installed first, and points them at Auto LC Setup in Quick Tools below. This is for the users who don't read the guide
+
+### Steam path detection (Linux)
+
+- Fixed "Steam installation path couldn't be found" on CachyOS, Arch, and other distros that don't ship the legacy `~/.steam/root` symlink. The GUI now probes `~/.steam/steam`, `~/.local/share/Steam`, the Flatpak sandbox at `~/.var/app/com.valvesoftware.Steam/data/Steam`, and the Snap install — same set the CLI already covered
+- Steam product info no longer crashes the GUI when the connection drops mid-fetch. Plain socket timeouts, connection resets, and EOFs are now caught alongside the gevent timeout that was already handled. After three retries SteaMidra falls back to an empty result and surfaces a clean "no info" message instead of taking the worker thread down
+
+### Store / search
+
+- Search now matches games whose names carry trademark, registered, or copyright marks. Typing `lego batman` finally hits `LEGO® Batman™: Legacy of the Dark Knight`, and `resident evil requiem` finds `Resident Evil Requiem` regardless of whatever decorative punctuation Steam ships in the catalog name. Accents (café, jalapeño) collapse to their plain ASCII equivalent on both sides of the comparison
+
 ## 6.2.3
 
 ### SteaMidra — Revert Fix Game changes actually works

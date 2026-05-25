@@ -57,6 +57,28 @@ Run `SteaMidra_GUI.exe` and add a game on the Home tab. LumaCore makes it appear
 
 ---
 
+## Linux quick start
+
+LumaCore is a Steam-client DLL hijack and is **Windows-only**. On Linux, SteaMidra uses **SLSsteam** (license/family-share injection) plus **SLScheevo** (achievement-only Steam client) instead. Manifests, depot keys, and ACFs work the same as on Windows.
+
+### Step 1: Download the Linux build
+
+Grab `SteaMidra-x.x.x-linux.zip` (or the AppImage) from the [releases page](https://github.com/Midrags/SFF/releases/latest) and extract it. CachyOS, Arch, Debian, Ubuntu, Fedora, and Steam Deck Desktop Mode are all supported.
+
+### Step 2: Set up SLSsteam + SLScheevo
+
+Launch SteaMidra, open **Quick Tools**, run **Set up Linux tools (SLSsteam + .NET 9)**. SteaMidra installs SLSsteam into `~/.steam/steam/` (or whichever Steam install it found), drops `SLSteam.so` and `library-inject.so`, and verifies your `.NET 9` runtime is on PATH (DepotDownloaderMod needs it).
+
+If the GUI reports `SLSteam libraries not found: SLSteam.so, library-inject.so`, the install step has not run yet — open Quick Tools and run it.
+
+### Step 3: Add a game
+
+Add a game on the Home tab the same way as Windows. SteaMidra writes the lua to `config/stplug-in/`, drops the manifests, registers depot keys, and writes the ACF. **Restart Steam from inside SteaMidra** so SLSsteam injects into the new Steam process — without injection, ownership and family bypass do not work.
+
+For the full walkthrough (supported distros, troubleshooting, what files go where, Steam-Deck-specific notes), see [docs/LINUX_SETUP.md](docs/LINUX_SETUP.md).
+
+---
+
 ## GUI features
 
 SteaMidra has a full graphical interface with a **Modern UI (new in 5.5.0, updated in 6.0.0)** and the classic Qt interface.
@@ -135,6 +157,12 @@ See [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) for common problems and s
 **fzf** – Used for fuzzy search in menus (CLI). License in `third_party_licenses/fzf.LICENSE`.
 
 **SteamAutoCrack** – The SteamAutoCrack feature uses the **SteamAutoCrack CLI** by oureveryday. Bundled in `third_party/SteamAutoCrack/cli/`. License in `third_party_licenses/SteamAutoCrack.LICENSE`.
+
+**DDMod (DepotDownloaderMod)** – The Direct Download via DDMod feature uses **DepotDownloaderMod** by **oureveryday**. License in `third_party_licenses/DDMod.license`.
+
+**ManifestHub** – The ManifestHub source uses the manifest archive maintained by **oureveryday**.
+
+**rclone** – Cloud Saves uses **rclone** for transfers to remote storage providers. License in `third_party_licenses/rclone.LICENSE`.
 
 **CreamInstaller** – The DLC Unlockers feature is inspired by and compatible with CreamInstaller. SteaMidra does not ship CreamInstaller; it provides its own implementation that follows similar behavior.
 

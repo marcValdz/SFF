@@ -405,15 +405,16 @@ class GameHandler:
                 print(Fore.RED + msg + Style.RESET_ALL)
                 return False, msg
 
-        # --exp enables the experimental unpackers covering Steam Stub v3.0
-        # and v3.1, which is what current Steam-DRM titles (Teardown,
-        # Doom Eternal, etc.) ship with. Without it Steamless only handles
-        # the older v1/v2 wrappers and fails silently on modern games.
-        # --quiet suppresses Steamless's own banner; we still capture stdout.
+        # --exp turns on experimental variants for newer SteamStub
+        # revisions (Teardown, Doom Eternal, modern UE5 / Unity titles).
+        # --realign and --recalcchecksum keep section alignment / file
+        # checksum valid on x64 binaries that ship with mismatched layout
+        # after the wrapper strip. Same flag set SteamAutoCrack uses.
         cmd = [
             str(steamless_exe.absolute()),
             "--exp",
-            "--quiet",
+            "--realign",
+            "--recalcchecksum",
             str(game_exe.absolute()),
         ]
         print(Fore.CYAN + f"Steamless: running on {game_exe.name}..." + Style.RESET_ALL)
@@ -675,6 +676,23 @@ class GameHandler:
             print("Check the error messages above for details.")
 
     def apply_hv_fix(self, app_info):
+        # 6.2.4 hotfix: HV Auto temporarily disabled. HVAuto's downloads
+        # are hosted on buzzheavier, which is currently serving malware
+        # ad pop-ups and fake download buttons. Bail before any prompt
+        # or temp-dir activity so users can't accidentally hit the bad
+        # ads. Re-enable once HVAuto switches to a safer host.
+        print("\n" + Fore.CYAN + "HyperVisor Bypasses (HVAuto)" + Style.RESET_ALL)
+        print(Fore.YELLOW
+              + "HV Auto is temporarily disabled.\n"
+              + "  HVAuto's downloads are hosted on buzzheavier, which "
+              + "is currently serving malware ads and fake download "
+              + "buttons. We've blocked the integration in SteaMidra "
+              + "until the fixes move to a safer host (pixeldrain, "
+              + "mediafire, or similar). Sorry for the inconvenience."
+              + Style.RESET_ALL)
+        return
+
+    def _apply_hv_fix_real(self, app_info):
         import time
         if not get_setting(Settings.HV_FIRST_USE_WARNED):
             warning = (

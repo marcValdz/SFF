@@ -164,6 +164,21 @@ window.Settings = (function() {
             }
         });
 
+        // Test Ryuu Key — probes the test/refresh endpoint with appid=440.
+        // Result lands in the existing task_finished signal handler below.
+        var ryuuTestBtn = document.getElementById('setting-ryuu-test');
+        if (ryuuTestBtn) {
+            ryuuTestBtn.addEventListener('click', function() {
+                if (ryuuTestBtn.disabled) return;
+                ryuuTestBtn.disabled = true;
+                if (!ryuuTestBtn.dataset.originalText) {
+                    ryuuTestBtn.dataset.originalText = ryuuTestBtn.textContent;
+                }
+                ryuuTestBtn.textContent = 'Testing...';
+                Bridge.call('test_ryuu_key');
+            });
+        }
+
         // Manifest excludes save
         var manifestExcludesSave = document.getElementById('setting-manifest-excludes-save');
         if (manifestExcludesSave) {
@@ -272,6 +287,28 @@ window.Settings = (function() {
                             });
                         }
                     }
+                } else if (data.task === 'test_ryuu_key') {
+                    var rbtn = document.getElementById('setting-ryuu-test');
+                    if (rbtn) {
+                        rbtn.disabled = false;
+                        rbtn.textContent = rbtn.dataset.originalText || 'Test Ryuu Key';
+                    }
+                    if (data.ok) {
+                        Components.showToast('success', 'Ryuu key works (200 OK)');
+                    } else if (data.reason === 'no_api_key') {
+                        Components.showToast('warning', 'No Ryuu API key configured');
+                    } else if (data.reason === 'appid not in db') {
+                        Components.showToast('warning', 'Ryuu key accepted but appid 440 not in db');
+                    } else if (data.error) {
+                        Components.showToast('error', 'Ryuu test failed: ' + data.error);
+                    } else {
+                        var bodySnippet = (data.body || '').slice(0, 200);
+                        Components.showToast(
+                            'error',
+                            'Ryuu rejected: ' + (data.status || '?') +
+                            (bodySnippet ? ' — ' + bodySnippet : '')
+                        );
+                    }
                 }
             } catch(e) {}
         });
@@ -301,6 +338,14 @@ window.Settings = (function() {
         if (updateLink) {
             updateLink.addEventListener('click', function(e) {
                 e.preventDefault();
+                // Block double-fires while a check is in flight.
+                if (updateLink.disabled) return;
+                // Stash original markup so app.js task_finished can restore it.
+                if (!updateLink.dataset.originalHtml) {
+                    updateLink.dataset.originalHtml = updateLink.innerHTML;
+                }
+                updateLink.innerHTML = '<svg class="spinner" viewBox="0 0 24 24" width="16" height="16" aria-hidden="true"><circle cx="12" cy="12" r="9" fill="none" stroke="currentColor" stroke-width="3" stroke-dasharray="42 16" stroke-linecap="round"></circle></svg>';
+                updateLink.disabled = true;
                 Bridge.call('run_game_action', '', 'check_updates');
             });
         }
@@ -354,6 +399,10 @@ window.Settings = (function() {
             'setting-advanced-mode': 'advanced_mode',
             'setting-use-smokeapi': 'use_smokeapi',
             'setting-hide-store-images': 'hide_store_images',
+            'setting-auto-update-check': 'auto_update_check',
+            'setting-close-to-tray': 'close_to_tray',
+            'setting-manifest-preserve': 'manifest_preserve',
+            'setting-store-show-software': 'store_show_software',
         };
         Object.keys(checkboxes).forEach(function(id) {
             var el = document.getElementById(id);
@@ -474,6 +523,36 @@ window.Settings = (function() {
                 _setCheckbox('setting-use-smokeapi', settings.use_smokeapi);
                 _setCheckbox('setting-hide-store-images', settings.hide_store_images);
                 Components.setHideImages(settings.hide_store_images === 'True');
+                // A9: default ON unless explicitly stored as False
+                var autoUpd = settings.auto_update_check;
+                _setCheckbox('setting-auto-update-check', (autoUpd === '' || autoUpd === undefined) ? 'True' : autoUpd);
+                // 6.2.4 hotfix: default ON unless explicitly stored as
+                // False. Tray behaviour matches the manifest_preserve
+                // / auto_update_check pattern. Users who want X = quit
+                // can flip it off; everyone else gets close-to-tray.
+                var closeToTray = settings.close_to_tray;
+                _setCheckbox(
+                    'setting-close-to-tray',
+                    (closeToTray === '' || closeToTray === undefined)
+                        ? 'True'
+                        : closeToTray
+                );
+                // A15: default ON unless explicitly stored as False, mirroring auto_update_check.
+                var manifestPreserve = settings.manifest_preserve;
+                _setCheckbox(
+                    'setting-manifest-preserve',
+                    (manifestPreserve === '' || manifestPreserve === undefined)
+                        ? 'True'
+                        : manifestPreserve
+                );
+                // A17: default ON unless explicitly stored as False, mirroring auto_update_check.
+                var storeShowSoftware = settings.store_show_software;
+                _setCheckbox(
+                    'setting-store-show-software',
+                    (storeShowSoftware === '' || storeShowSoftware === undefined)
+                        ? 'True'
+                        : storeShowSoftware
+                );
                 // Theme
                 if (settings.theme) _applyTheme(settings.theme);
             } catch(e) {

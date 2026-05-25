@@ -60,9 +60,13 @@ def read_lua_from_zip(
                 elif file.filename.endswith(".manifest"):
                     filename = Path(file.filename).name
                     data = f.read(file)
-                    # Always save to ./manifests/ as staging area
-                    manifests_dir = Path.cwd() / "manifests"
-                    manifests_dir.mkdir(exist_ok=True)
+                    # Always save to the staging dir so the Linux DDMod
+                    # forwarder and the depotcache pre-seeder can find
+                    # them. Path.cwd() is unreliable on AppImage / Web UI
+                    # launches; manifests_staging_dir() resolves to the
+                    # writable user-data root.
+                    from sff.utils import manifests_staging_dir
+                    manifests_dir = manifests_staging_dir()
                     (manifests_dir / filename).write_bytes(data)
                     # Always write to depotcache — fresh ZIP data wins over
                     # stale local copies (prevents 'no internet connection')

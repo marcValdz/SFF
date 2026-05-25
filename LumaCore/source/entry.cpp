@@ -1,7 +1,13 @@
+// LumaCore — Steam client hook layer for SteaMidra.
+// Copyright (c) 2025-2026 Midrag (https://github.com/Midrags).
+// Distributed under the GNU General Public License v3 or later.
+// See <https://www.gnu.org/licenses/> for the full license text.
+
 #include "entry.h"
 #include "hooks/CoreLoader.h"
 #include "hooks/PackagePatch.h"
 #include "utils/DirWatch.h"
+#include "utils/Diagnostics.h"
 
 // Prepares the runtime paths and loads the hooked copy of steamclient64.dll.
 //
@@ -132,6 +138,12 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD dwReason, PVOID pvReserved)
     }
     else if (dwReason == DLL_PROCESS_DETACH)
     {
+#ifdef LUMACORE_DIAGNOSTICS_ENABLED
+        // A16 belt-and-suspenders: flush the achievement diagnostic ring
+        // first thing on DLL detach so a crash inside CoreLoader::Detach
+        // never loses the captured events. Defensive write-and-return.
+        Diagnostics::DumpForDetach();
+#endif
         if (g_InitThread) {
             WaitForSingleObject(g_InitThread, 5000);
             CloseHandle(g_InitThread);

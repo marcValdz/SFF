@@ -17,15 +17,11 @@
 # along with SteaMidra.  If not, see <https://www.gnu.org/licenses/>.
 
 
-from functools import partial
-
 import logging
 
 import os
 
 import subprocess
-
-import threading
 
 import time
 
@@ -34,8 +30,6 @@ from pathlib import Path
 
 import psutil
 
-
-from sff.extras import Konami, replace_boot_image
 
 from sff.prompts import prompt_confirm
 
@@ -129,10 +123,9 @@ def launch_steam_unelevated(steam_exe: Path, cwd: Path | None = None) -> tuple[b
 
 class SteamProcess:
 
-    def __init__(self, steam_path: Path, applist_folder: Path = None):
+    def __init__(self, steam_path: Path):
 
         self.steam_path = steam_path
-        self.injector_dir = applist_folder.parent if applist_folder else None
         self.exe_name = "steam.exe"
         self.wait_time = 3
 
@@ -182,11 +175,7 @@ class SteamProcess:
 
     def prompt_launch_or_restart(self):
 
-        watcher = Konami(on_success=partial(replace_boot_image, self.injector_dir))
-        t = threading.Thread(target=watcher.listen, daemon=True)
-        t.start()
         do_start = prompt_confirm("Would like me to restart/start Steam for you?")
-        watcher.stop()
         if not do_start:
             return False
         if is_proc_running(self.exe_name):

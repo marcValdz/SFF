@@ -48,29 +48,15 @@ class GameInfo:
 
 class LibraryScanner:
 
-    def __init__(self, steam_path, lua_backup_path, applist_folder = None):
+    def __init__(self, steam_path, lua_backup_path):
         self.steam_path = steam_path
         self.lua_backup_path = lua_backup_path
-        self.applist_folder = applist_folder
 
     def _get_injection_ids(self):
-        app_ids = set()
-        if not self.applist_folder or not self.applist_folder.exists():
-            return app_ids
-        try:
-            for file in self.applist_folder.glob("*.txt"):
-                if not file.stem.isdigit():
-                    continue
-                try:
-                    content = file.read_text(encoding="utf-8").strip()
-                    if content.isdigit():
-                        app_ids.add(int(content))
-                except Exception as e:
-                    logger.debug(f"Failed to read {file.name}: {e}")
-            logger.info(f"Found {len(app_ids)} IDs in AppList folder")
-        except Exception as e:
-            logger.error(f"Failed to scan AppList folder: {e}")
-        return app_ids
+        # legacy GreenLuma AppList scanning is gone; LumaCore lives in
+        # config/stplug-in as Lua files, not txt counters. Returning an
+        # empty set keeps callers happy without faking app ids.
+        return set()
 
     def _scan_all_drives(self):
         steam_libs = []

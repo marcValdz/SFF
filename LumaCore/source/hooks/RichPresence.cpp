@@ -1,3 +1,8 @@
+// LumaCore — Steam client hook layer for SteaMidra.
+// Copyright (c) 2025-2026 Midrag (https://github.com/Midrags).
+// Distributed under the GNU General Public License v3 or later.
+// See <https://www.gnu.org/licenses/> for the full license text.
+
 #include "RichPresence.h"
 #include "RuntimeCapture.h"
 #include "utils/LuaLoader.h"
@@ -12,17 +17,17 @@ namespace RichPresence {
     {
         CMsgClientPersonaState msg;
         if (!msg.ParseFromArray(pBody, cbBody)) {
-            LOG_MISC_WARN("RichPresence: failed to parse CMsgClientPersonaState");
+            LOG_MISCCH_WARN("RichPresence: failed to parse CMsgClientPersonaState");
             return false;
         }
 
         AppId_t realAppId = SteamCapture::ResolveAppId();
         if (!realAppId) {
-            LOG_MISC_TRACE("RichPresence: no realAppId (no -onlinefix active), skip");
+            LOG_MISCCH_TRACE("RichPresence: no realAppId (no -onlinefix active), skip");
             return false;
         }
         if (!LuaLoader::HasDepot(realAppId)) {
-            LOG_MISC_TRACE("RichPresence: realAppId={} not in depot list, skip", realAppId);
+            LOG_MISCCH_TRACE("RichPresence: realAppId={} not in depot list, skip", realAppId);
             return false;
         }
 
@@ -40,24 +45,24 @@ namespace RichPresence {
             if (!name.empty())
                 f->set_game_name(name);
 
-            LOG_MISC_INFO("RichPresence: patched friendid={} 480 -> {} ({})",
+            LOG_MISCCH_INFO("RichPresence: patched friendid={} 480 -> {} ({})",
                           f->friendid(), realAppId, name);
             patched = true;
         }
 
         if (!patched) {
-            LOG_MISC_TRACE("RichPresence: realAppId={} active, friends={} seen480={} (nothing to patch)",
+            LOG_MISCCH_TRACE("RichPresence: realAppId={} active, friends={} seen480={} (nothing to patch)",
                            realAppId, msg.friends_size(), seen480);
             return false;
         }
 
         uint32 sz = static_cast<uint32>(msg.ByteSizeLong());
         if (sz > outBufSize) {
-            LOG_MISC_WARN("RichPresence: serialized size {} exceeds buffer {}", sz, outBufSize);
+            LOG_MISCCH_WARN("RichPresence: serialized size {} exceeds buffer {}", sz, outBufSize);
             return false;
         }
         if (!msg.SerializeToArray(pOutBuf, static_cast<int>(outBufSize))) {
-            LOG_MISC_WARN("RichPresence: failed to SerializeToArray");
+            LOG_MISCCH_WARN("RichPresence: failed to SerializeToArray");
             return false;
         }
 

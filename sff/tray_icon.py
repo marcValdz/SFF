@@ -48,11 +48,12 @@ from PyQt6.QtCore import pyqtSignal, QObject, QTimer, Qt
 
 logger = logging.getLogger(__name__)
 
-# Retry cadence: every 3 s for up to 90 s. Covers the worst-case
-# Windows shell startup delay we have observed (cold boot on a low-spec
-# machine, which can take ~30 s before the system tray becomes available).
+# Retry cadence: every 3 s for up to 5 min. The fast 90 s loop we used
+# before kept hammering the systray API on machines where the shell
+# never becomes available; the WM_TASKBARCREATED filter in Main_gui.py
+# catches Explorer restarts directly, so the long backstop is enough.
 _RETRY_INTERVAL_MS = 3000
-_RETRY_TIMEOUT_MS = 90_000
+_RETRY_TIMEOUT_MS = 300_000
 
 # How often to nudge the tray icon back to visible. Catches Explorer
 # restarts and the occasional cases where the icon "falls off" the tray.

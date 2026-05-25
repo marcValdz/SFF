@@ -1,3 +1,8 @@
+// LumaCore — Steam client hook layer for SteaMidra.
+// Copyright (c) 2025-2026 Midrag (https://github.com/Midrags).
+// Distributed under the GNU General Public License v3 or later.
+// See <https://www.gnu.org/licenses/> for the full license text.
+
 #include "entry.h"
 #include "DirWatch.h"
 #include "LuaLoader.h"
@@ -38,7 +43,7 @@ namespace DirWatch {
                 FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OVERLAPPED,
                 nullptr);
             if (hDir == INVALID_HANDLE_VALUE) {
-                LOG_PACKAGE_WARN("DirWatch: failed to open '{}' (err={})", path, GetLastError());
+                LOG_PKGCH_WARN("DirWatch: failed to open '{}' (err={})", path, GetLastError());
                 CloseHandle(hEvent);
                 hDir = hEvent = nullptr;
                 return false;
@@ -52,7 +57,7 @@ namespace DirWatch {
                                        FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_LAST_WRITE,
                                        &nb, &ov, nullptr)) {
                 if (GetLastError() != ERROR_IO_PENDING) {
-                    LOG_PACKAGE_WARN("DirWatch: ReadDirectoryChangesW failed (err={})",
+                    LOG_PKGCH_WARN("DirWatch: ReadDirectoryChangesW failed (err={})",
                                      GetLastError());
                     return false;
                 }
@@ -80,7 +85,7 @@ namespace DirWatch {
                         for (size_t i = 0; i < fn.size(); ++i)
                             name[i] = static_cast<char>(fn[i]);
                         std::string full = path + "\\" + name;
-                        LOG_PACKAGE_INFO("Lua file {}: {}",
+                        LOG_PKGCH_INFO("Lua file {}: {}",
                             act == FILE_ACTION_ADDED    ? "added"    :
                             act == FILE_ACTION_MODIFIED ? "modified" : "removed", name);
                         if (!acc.count(full)) ordering.push_back(full);
@@ -114,7 +119,7 @@ namespace DirWatch {
         for (size_t i = 0; i < slots.size(); ++i) {
             slots[i].path = g_dirs[i];
             if (slots[i].Open())
-                LOG_PACKAGE_INFO("DirWatch: watching '{}'", g_dirs[i]);
+                LOG_PKGCH_INFO("DirWatch: watching '{}'", g_dirs[i]);
         }
 
         // Collect only the valid slots into the event/index arrays for WaitForMultipleObjects.
@@ -130,7 +135,7 @@ namespace DirWatch {
         }
 
         if (evts.empty()) {
-            LOG_PACKAGE_WARN("DirWatch: no directories could be opened");
+            LOG_PKGCH_WARN("DirWatch: no directories could be opened");
             for (auto& s : slots) s.Close();
             return;
         }
@@ -157,7 +162,7 @@ namespace DirWatch {
             }
 
             if (!ordering.empty()) {
-                LOG_PACKAGE_INFO("DirWatch: processing {} Lua file change(s)", ordering.size());
+                LOG_PKGCH_INFO("DirWatch: processing {} Lua file change(s)", ordering.size());
                 for (const auto& fullPath : ordering) {
                     if (acc[fullPath] == FILE_ACTION_REMOVED)
                         LuaLoader::UnloadFile(fullPath);
@@ -165,17 +170,17 @@ namespace DirWatch {
                         LuaLoader::ParseFile(fullPath);
                 }
                 SteamCapture::NotifyLicenseChanged();
-                LOG_PACKAGE_INFO("DirWatch: refresh completed");
+                LOG_PKGCH_INFO("DirWatch: refresh completed");
             }
         }
 
         for (auto& s : slots) s.Close();
-        LOG_PACKAGE_INFO("DirWatch: stopped");
+        LOG_PKGCH_INFO("DirWatch: stopped");
     }
 
     void Start(const std::vector<std::string>& directories) {
         if (g_alive.exchange(true)) {
-            LOG_PACKAGE_WARN("DirWatch: already running");
+            LOG_PKGCH_WARN("DirWatch: already running");
             return;
         }
         g_dirs          = directories;

@@ -1,3 +1,8 @@
+// LumaCore — Steam client hook layer for SteaMidra.
+// Copyright (c) 2025-2026 Midrag (https://github.com/Midrags).
+// Distributed under the GNU General Public License v3 or later.
+// See <https://www.gnu.org/licenses/> for the full license text.
+
 #include "SteamUI.h"
 #include "CoreLoader.h"
 #include "Macros.h"
@@ -11,12 +16,12 @@ namespace {
     constexpr int  MAX_RETRY      = 20;
     constexpr auto RETRY_INTERVAL = 300ms;
 
-    // ── function type aliases ─────────────────────────────────────────────────
+    // ▌ STEAMUI ▌ function type aliases
     using AddProtobufAsBinary_t = void*(__fastcall*)(void* /*args*/, void* /*proto*/);
     using GetAppByID_t          = void*(__fastcall*)(void* /*controller*/, AppId_t, bool /*create*/);
     using GetTopManager_t       = void*(__fastcall*)();
 
-    // ── resolved function pointers ────────────────────────────────────────────
+    // ▌ STEAMUI ▌ resolved function pointers
     inline AddProtobufAsBinary_t oAddProtobufAsBinary = nullptr;
     inline GetAppByID_t          oGetAppByID          = nullptr;
     inline GetTopManager_t       oGetTopManager       = nullptr;
@@ -36,12 +41,12 @@ namespace {
     // vtable[22]) also excludes the app on the next full snapshot.
     constexpr size_t kCSteamAppOwnedFlagOffset   = 28;
 
-    // ── LoadModuleWithPath hook ───────────────────────────────────────────────
+    // ▌ STEAMUI ▌ LoadModuleWithPath hook
     LC_HOOK_DEF(LoadModuleWithPath, HMODULE, const char* path, bool flags) {
-        LOG_STEAMUI_INFO("LoadModuleWithPath called with path: {} , flags: {}", path, flags);
+        LOG_STEAMUICH_INFO("LoadModuleWithPath called with path: {} , flags: {}", path, flags);
         // Wait for steamclient hooks to be installed before redirecting.
-        for (int i = 0; i < MAX_RETRY && !g_HooksInstalled.load(); ++i) {
-            LOG_STEAMUI_DEBUG("LoadModuleWithPath: waiting for hooks... (attempt {}/{})", i + 1, MAX_RETRY);
+        for (int idx = 0; idx < MAX_RETRY && !g_HooksInstalled.load(); ++idx) {
+            LOG_STEAMUICH_DEBUG("LoadModuleWithPath: waiting for hooks... (attempt {}/{})", idx + 1, MAX_RETRY);
             std::this_thread::sleep_for(RETRY_INTERVAL);
         }
         HMODULE h = oLoadModuleWithPath(path, flags);
@@ -50,7 +55,7 @@ namespace {
         return h;
     }
 
-    // ── TopManagerCall decode ─────────────────────────────────────────────────
+    // ▌ STEAMUI ▌ TopManagerCall decode
     // The TopManagerCall anchor matches inside MarkAppChange's body.
     // Decode the rel32 at +10 to find the 2-instruction getter:
     //   mov rax, [rip+disp]; ret
@@ -84,7 +89,7 @@ namespace {
         alignas(8) uint8_t argsBuf[kArgsSize] = {};
 
         ::CAppOverview_Change msg;
-        for (size_t i = 0; i < count; ++i) msg.add_removed_appid(ids[i]);
+        for (size_t idx = 0; idx < count; ++idx) msg.add_removed_appid(ids[idx]);
         msg.set_update_complete(true);
         oAddProtobufAsBinary(argsBuf, &msg);
 
@@ -94,12 +99,12 @@ namespace {
             static_cast<uint8_t*>(pController) + kSubscriberVecSizeOffset);
 
         if (!vecData || subCount == 0) {
-            LOG_STEAMUI_WARN("EmitRemovedAppIds: no subscribers; count={}", count);
+            LOG_STEAMUICH_WARN("EmitRemovedAppIds: no subscribers; count={}", count);
             return false;
         }
 
-        for (uint32_t i = 0; i < subCount; ++i) {
-            void* subscriber = vecData[i];
+        for (uint32_t idx = 0; idx < subCount; ++idx) {
+            void* subscriber = vecData[idx];
             if (!subscriber) continue;
             void** vtable = *reinterpret_cast<void***>(subscriber);
             auto invoke = reinterpret_cast<void(__fastcall*)(void*, void*)>(
@@ -117,7 +122,7 @@ namespace SteamUI {
     void CoreHook() {
         HMODULE hSteamUI = GetModuleHandleA("steamui.dll");
         if (!hSteamUI) {
-            LOG_STEAMUI_WARN("steamui.dll not loaded; SteamUI hooks disabled");
+            LOG_STEAMUICH_WARN("steamui.dll not loaded; SteamUI hooks disabled");
             return;
         }
 
@@ -143,7 +148,7 @@ namespace SteamUI {
         auto* anchor = static_cast<uint8_t*>(FIND_SIG(hSteamUI, TopManagerCall));
         oGetTopManager = DecodeTopManagerGetter(anchor);
 
-        LOG_STEAMUI_INFO("Install: GetAppByID={}, AddProtobufAsBinary={}, GetTopManager={}",
+        LOG_STEAMUICH_INFO("Install: GetAppByID={}, AddProtobufAsBinary={}, GetTopManager={}",
                          reinterpret_cast<void*>(oGetAppByID),
                          reinterpret_cast<void*>(oAddProtobufAsBinary),
                          reinterpret_cast<void*>(oGetTopManager));
@@ -161,13 +166,13 @@ namespace SteamUI {
 
     void RemoveAppOverview(AppId_t appId) {
         if (!oAddProtobufAsBinary || !oGetTopManager || !oGetAppByID) {
-            LOG_STEAMUI_WARN("RemoveAppOverview: primitives unresolved; appId={}", appId);
+            LOG_STEAMUICH_WARN("RemoveAppOverview: primitives unresolved; appId={}", appId);
             return;
         }
 
         void* pController = ResolveController();
         if (!pController) {
-            LOG_STEAMUI_WARN("RemoveAppOverview: controller singleton not initialized; appId={}", appId);
+            LOG_STEAMUICH_WARN("RemoveAppOverview: controller singleton not initialized; appId={}", appId);
             return;
         }
 
@@ -181,7 +186,7 @@ namespace SteamUI {
 
         if (!EmitRemovedAppId(pController, appId)) return;
 
-        LOG_STEAMUI_INFO("RemoveAppOverview: appId={} done", appId);
+        LOG_STEAMUICH_INFO("RemoveAppOverview: appId={} done", appId);
     }
 
     // Kept for API stability — only used when callers explicitly want a
@@ -190,8 +195,8 @@ namespace SteamUI {
     // multi-id CAppOverview_Change bursts in some build/load combos.
     void RemoveAppOverviewBatch(const AppId_t* ids, size_t count) {
         if (!ids || count == 0) return;
-        for (size_t i = 0; i < count; ++i) {
-            RemoveAppOverview(ids[i]);
+        for (size_t idx = 0; idx < count; ++idx) {
+            RemoveAppOverview(ids[idx]);
         }
     }
 

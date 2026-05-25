@@ -1,3 +1,8 @@
+// LumaCore - Steam client hook layer for SteaMidra.
+// Copyright (c) 2025-2026 Midrag (https://github.com/Midrags).
+// Distributed under the GNU General Public License v3 or later.
+// See <https://www.gnu.org/licenses/> for the full license text.
+
 #include "RuntimeCapture.h"
 #include "Macros.h"
 #include "PackagePatch.h"
@@ -21,7 +26,6 @@ namespace {
     // ── X-macro lists ────────────────────────────────────────────────────────
     // One-shot int3: on hit, ctx->Rcx stored to the named output variable.
     #define VEH_GRAB_LIST(X)                         \
-        X(GetAppIDForCurrentPipe, g_steamEngine)     \
         X(GetAppDataFromAppInfo,  g_pCAppInfoCache)
 
     // Resolve-only (no int3).
@@ -47,11 +51,50 @@ namespace {
     void DoStartupInjection();
 
     // ── per-session state ─────────────────────────────────────────────────────
+    void*                 g_steamEngine        = nullptr;
     uint8_t*              g_spawnProcessTarget = nullptr;
     PVOID                 g_vehHandle          = nullptr;
     std::atomic<AppId_t>  g_OnlineFixRealAppId{0};
+    // Scoped real-appid override depth for IClientUserStats traffic.
+    // Thread-local so concurrent IPC pipes from worker threads don't bleed
+    // into each other. Incremented by SetUserStatsContext(true), decremented
+    // by SetUserStatsContext(false). Read by the GetAppIDForCurrentPipe
+    // detour to decide whether to return the real appid.
+    thread_local uint32   g_userStatsAppIdOverrideDepth = 0;
     std::unordered_map<AppId_t, std::string> g_GameNameCache;
     static std::vector<CaptureEntry> g_captures;
+
+    // ── GetAppIDForCurrentPipe Detours hook ───────────────────────────────────
+    // Captures g_steamEngine (RCX = this) on first call and applies the scoped
+    // real-appid override for IClientUserStats traffic.
+    //
+    // The override returns the real appid only when ALL of:
+    //   1. SetUserStatsContext(true) is currently on the stack on this thread
+    //      (g_userStatsAppIdOverrideDepth > 0)
+    //   2. OnlineFix is active for this session (g_OnlineFixRealAppId != 0)
+    //   3. The engine itself reports the Spacewar masquerade (appid == 480)
+    //
+    // Every other call path returns the engine's value untouched. That keeps
+    // the lobby / friends / controller / RemoteStorage paths byte-identical
+    // to the existing 480 behaviour. The depth counter is thread-local so
+    // concurrent IPC pipes don't bleed into each other.
+    LC_HOOK_DEF(GetAppIDForCurrentPipe, AppId_t, void* pEngine) {
+        if (g_steamEngine == nullptr && pEngine != nullptr) {
+            g_steamEngine = pEngine;
+            LOG_MISC_INFO("Captured g_steamEngine: 0x{:X}",
+                          reinterpret_cast<uint64_t>(pEngine));
+        }
+        AppId_t appid = oGetAppIDForCurrentPipe(pEngine);
+        if (g_userStatsAppIdOverrideDepth > 0
+            && g_OnlineFixRealAppId.load(std::memory_order_acquire) != 0
+            && appid == kOnlineFixAppId) {
+            AppId_t real = g_OnlineFixRealAppId.load(std::memory_order_acquire);
+            LOG_MISC_TRACE("GetAppIDForCurrentPipe: stats-scope override {} -> {}",
+                           appid, real);
+            return real;
+        }
+        return appid;
+    }
 
     // ── BuildSpawnEnvBlock Detours hook ──────────────────────────────────────
     // Patches pOverlayCGameID from 480 to the real appid before delegating.
@@ -254,7 +297,6 @@ namespace SteamCapture {
 
         VEH_TRACK_LIST(VEH_LOCATE)
 
-        ARM_CAPTURE_D(GetAppIDForCurrentPipe, g_steamEngine);
         ARM_CAPTURE_STR_D(GetAppDataFromAppInfo, g_pCAppInfoCache,
                           GetAppDataFromAppInfoStrSigs, GetAppDataFromAppInfoSigs);
 
@@ -269,7 +311,11 @@ namespace SteamCapture {
         // Hook MarkLicenseAsChanged and GetPackageInfo with Detours to capture
         // pCUser and pCPackageInfo on first call. This replaces the old VEH int3
         // approach which missed the first call (happened before hooks were installed).
+        // GetAppIDForCurrentPipe is also detoured so it can apply the scoped
+        // real-appid override for IClientUserStats traffic and capture the
+        // engine pointer inline on the first natural call.
         LC_TX_OPEN();
+        LC_ATTACH_D(GetAppIDForCurrentPipe);
         LC_ATTACH_D(MarkLicenseAsChanged);
         LC_ATTACH_D(GetPackageInfo);
         LC_ATTACH_D(OptedInMask);
@@ -290,6 +336,7 @@ namespace SteamCapture {
         g_spawnProcessTarget = nullptr;
 
         LC_TX_OPEN();
+        LC_DETACH(GetAppIDForCurrentPipe);
         LC_DETACH(MarkLicenseAsChanged);
         LC_DETACH(GetPackageInfo);
         LC_DETACH(OptedInMask);
@@ -298,6 +345,8 @@ namespace SteamCapture {
 
         VEH_TRACK_LIST(VEH_ZERO_RESOLVE)
         g_OnlineFixRealAppId.store(0, std::memory_order_relaxed);
+        g_userStatsAppIdOverrideDepth = 0;
+        g_steamEngine   = nullptr;
         g_GameNameCache.clear();
         g_pCUser        = nullptr;
         g_pCPackageInfo = nullptr;
@@ -322,6 +371,16 @@ namespace SteamCapture {
         AppId_t onlineFix = g_OnlineFixRealAppId.load(std::memory_order_acquire);
         if (onlineFix) return onlineFix;
         return GetAppIDForCurrentPipe();
+    }
+
+    void SetUserStatsContext(bool active) {
+        if (active) {
+            ++g_userStatsAppIdOverrideDepth;
+        } else if (g_userStatsAppIdOverrideDepth > 0) {
+            --g_userStatsAppIdOverrideDepth;
+        } else {
+            LOG_MISC_WARN("SetUserStatsContext(false) called with depth=0; clamping");
+        }
     }
 
     void EnsureBufferSize(CUtlBuffer* pWrite, int32 size)

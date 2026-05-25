@@ -98,7 +98,12 @@ window.App = (function() {
                         );
                     }
                     if (result.task === 'download_fastest' && result.success) {
-                        Components.showModal('restart-after-download-modal');
+                        // 6.2.4: dropped the post-download Restart Steam
+                        // modal; LumaCore hot-reloads new entries on the
+                        // fly. The toast plus dropdown refresh is enough.
+                        var addedKey = 'Added to library. Open Steam to download.';
+                        var addedMsg = (window.I18n && I18n.t) ? I18n.t(addedKey) : addedKey;
+                        Components.showToast('success', addedMsg);
                         _populateGameDropdown();
                     }
                     if (result.task === 'download_ddmod' && result.success) {
@@ -109,6 +114,18 @@ window.App = (function() {
                         if (runBtn) runBtn.disabled = false;
                         var statusEl = document.getElementById('lc-setup-status');
                         if (statusEl) statusEl.textContent = result.success ? 'LumaCore installed.' : (result.message || 'Setup failed.');
+                        if (result.success) _refreshLcVersionInfo();
+                    }
+                    if (result.task === 'auto_lc_deactivate') {
+                        var deactBtn = document.getElementById('lc-deactivate-run');
+                        if (deactBtn) deactBtn.disabled = false;
+                        var statusElDeact = document.getElementById('lc-setup-status');
+                        if (statusElDeact) statusElDeact.textContent = result.message || (result.success ? 'LumaCore deactivated.' : 'Deactivate failed.');
+                        if (result.success) _refreshLcVersionInfo();
+                        Components.showToast(
+                            result.success ? 'success' : 'error',
+                            result.message || (result.success ? 'LumaCore deactivated.' : 'Deactivate failed.')
+                        );
                     }
                     if (result.task === 'lc_online_fix') {
                         var ofStatus = document.getElementById('lc-onlinefix-status');
@@ -117,12 +134,36 @@ window.App = (function() {
                     if (result.task === 'api_key_connected') {
                         Store.onApiKeyAvailable('');
                     }
+                    if (result.task === 'check_updates') {
+                        // A5: restore the Settings Update button.
+                        var updBtn = document.getElementById('about-update');
+                        if (updBtn) {
+                            updBtn.disabled = false;
+                            if (updBtn.dataset.originalHtml) {
+                                updBtn.innerHTML = updBtn.dataset.originalHtml;
+                                delete updBtn.dataset.originalHtml;
+                            }
+                        }
+                    }
                 } catch(e) {}
             });
 
             Bridge.on('log_message', function(msg) {
-                _appendLog(msg);
-                _appendHomeLog(msg);
+                // Python side now batches log lines and joins them
+                // with newlines so one emit can carry up to 200 lines.
+                // Split here so each line still becomes its own DOM
+                // node with the right level styling, but we only do
+                // one DOM append batch per emit (10 per second under
+                // load) instead of per producer line (thousands per
+                // second under load).
+                if (typeof msg !== 'string' || msg.length === 0) return;
+                var lines = msg.split('\n');
+                for (var i = 0; i < lines.length; i++) {
+                    var line = lines[i];
+                    if (line.length === 0) continue;
+                    _appendLog(line);
+                    _appendHomeLog(line);
+                }
             });
         });
 
@@ -713,13 +754,8 @@ window.App = (function() {
             });
         }
 
-        var rsDlBtn = document.getElementById('restart-after-dl-run');
-        if (rsDlBtn) {
-            rsDlBtn.addEventListener('click', function() {
-                Components.hideModal('restart-after-download-modal');
-                Bridge.call('restart_steam');
-            });
-        }
+        // 6.2.4: restart-after-dl-run handler dropped along with the modal.
+        // LumaCore picks up new manifests / keys live, no restart needed.
     }
 
     function _startDdmodDownload(appId, source, luaPath, manifestFolder) {
@@ -900,26 +936,10 @@ window.App = (function() {
     }
 
     function _startDownload(appId, mode, source, requestUpdate) {
-        // First, ask for library selection
-        Bridge.callSync('get_steam_libraries', function(json) {
-            var libs;
-            try { libs = JSON.parse(json || '[]'); } catch(e) { libs = []; }
-
-            if (libs.length === 0) {
-                Components.showToast('error', 'No Steam libraries found. Check your Steam path in Settings.');
-                return;
-            }
-
-            if (libs.length === 1) {
-                Bridge.call('set_active_library', libs[0]);
-                _executeDownload(appId, mode, source, requestUpdate);
-            } else {
-                Components.showLibraryModal(libs, function(selectedLib) {
-                    Bridge.call('set_active_library', selectedLib);
-                    _executeDownload(appId, mode, source, requestUpdate);
-                });
-            }
-        });
+        // Steam-source path performs no depot pull; the registration helpers
+        // run against the resolved steam_path, not a user-picked library.
+        // Skip the library picker so the modal stops promising a download.
+        _executeDownload(appId, mode, source, requestUpdate);
     }
 
     function _executeDownload(appId, mode, source, requestUpdate) {
@@ -1398,6 +1418,55 @@ window.App = (function() {
                 Bridge.call('install_lumacore', steamPath);
             });
         }
+
+        var deactivateBtn = document.getElementById('lc-deactivate-run');
+        if (deactivateBtn) {
+            deactivateBtn.addEventListener('click', function() {
+                var ok = window.confirm(
+                    'Deactivate LumaCore?\n\n' +
+                    'Steam will be closed first. SteaMidra will then remove ' +
+                    'LumaCore.dll, dwmapi.dll, and bin/lcoverlay.dll. ' +
+                    'Make sure no Steam process is open before continuing.'
+                );
+                if (!ok) return;
+                var statusEl = document.getElementById('lc-setup-status');
+                if (statusEl) statusEl.textContent = 'Deactivating LumaCore...';
+                deactivateBtn.disabled = true;
+                Bridge.call('lumacore_deactivate');
+            });
+        }
+
+        var refreshBtn = document.getElementById('lc-version-refresh');
+        if (refreshBtn) {
+            refreshBtn.addEventListener('click', function() {
+                _refreshLcVersionInfo();
+            });
+        }
+
+        // Initial version probe — uses the cached answer when available so
+        // there's no redundant network round-trip when the modal opens.
+        _refreshLcVersionInfo();
+    }
+
+    function _refreshLcVersionInfo() {
+        var installedEl = document.getElementById('lc-version-installed');
+        var latestEl    = document.getElementById('lc-version-latest');
+        var bannerEl    = document.getElementById('lc-version-update-banner');
+        if (installedEl) installedEl.textContent = 'checking...';
+        if (latestEl)    latestEl.textContent    = 'checking...';
+
+        Bridge.callWithCallback('lumacore_check_update', '', function(json) {
+            var data;
+            try { data = JSON.parse(json); } catch (e) { data = null; }
+            if (!data) {
+                if (installedEl) installedEl.textContent = '—';
+                if (latestEl)    latestEl.textContent    = '—';
+                return;
+            }
+            if (installedEl) installedEl.textContent = data.installed || 'not installed';
+            if (latestEl)    latestEl.textContent    = data.latest    || 'unknown';
+            if (bannerEl)    bannerEl.style.display  = data.update_available ? 'flex' : 'none';
+        });
     }
 
     var _lcOnlineFixInitialized = false;

@@ -1,12 +1,20 @@
+// LumaCore — Steam client hook layer for SteaMidra.
+// Copyright (c) 2025-2026 Midrag (https://github.com/Midrags).
+// Distributed under the GNU General Public License v3 or later.
+// See <https://www.gnu.org/licenses/> for the full license text.
+
 #pragma once
 
 #include "entry.h"
 
-// One-shot int3 traps that capture runtime Steam object pointers and handle
-// lightweight hooks that don't belong in a dedicated category:
-//   * GetAppIDForCurrentPipe  -> captures the SteamEngine pointer
+// Captures runtime Steam object pointers and handles lightweight hooks that
+// don't belong in a dedicated category:
+//   * GetAppIDForCurrentPipe  -> Detours hook; captures the SteamEngine
+//                                pointer on first call and applies the
+//                                scoped real-appid override for IClientUserStats
+//                                traffic (see SetUserStatsContext)
 //   * SpawnProcess            -> OnlineFix detection + 480 rewrite
-//   * GetAppDataFromAppInfo   -> captures the CAppInfoCache pointer
+//   * GetAppDataFromAppInfo   -> int3 trap; captures the CAppInfoCache pointer
 //   * MarkLicenseAsChanged    -> captures pCUser; resolved for NotifyLicenseChanged
 //   * GetPackageInfo          -> captures pCPackageInfo; used by NotifyLicenseChanged to append AppIds
 //   * ProcessPendingLicenseUpdates -> resolved for NotifyLicenseChanged
@@ -26,6 +34,13 @@ namespace SteamCapture {
     // Resolve the real appid: if OnlineFix is active return real appid,
     // otherwise fall back to GetAppIDForCurrentPipe().
     AppId_t ResolveAppId();
+
+    // Scoped real-appid override for IClientUserStats traffic. Increments
+    // a thread-local depth counter on active=true and decrements on
+    // active=false (underflow guarded). The GetAppIDForCurrentPipe detour
+    // returns the real appid only while depth > 0 AND OnlineFix is active
+    // AND the original engine call returned the Spacewar masquerade.
+    void SetUserStatsContext(bool active);
 
     // Get localized game name via GetAppDataFromAppInfo (cached).
     std::string GetGameNameByAppID(AppId_t appId);

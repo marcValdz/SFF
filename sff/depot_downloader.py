@@ -63,8 +63,11 @@ def _copy_manifests_to_temp(steam_path: Path, manifests: dict) -> None:
                 shutil.copy2(src, dst)
                 break
 
-    # Also check the local ./manifests/ staging folder
-    staging = Path.cwd() / "manifests"
+    # Also check the canonical staging folder (where ZIP-based providers
+    # like Hubcap / oureveryday / Ryuu drop manifests after extraction).
+    # Path.cwd() was wrong on AppImage launches and Web UI workers.
+    from sff.utils import manifests_staging_dir
+    staging = manifests_staging_dir()
     if staging.exists():
         for depot_id, manifest_id in manifests.items():
             filename = f"{depot_id}_{manifest_id}.manifest"
@@ -119,8 +122,40 @@ def run_download(
 ) -> Tuple[bool, int]:
     appid = str(game_data["appid"])
     depots = game_data.get("depots", {})
-    manifests = game_data.get("manifests", {})
+    manifests = dict(game_data.get("manifests", {}) or {})
     installdir = game_data.get("installdir") or f"App_{appid}"
+
+    # Auto-fill manifests from the staging dir for any selected depot
+    # the caller did not pin a manifest for. The staging dir is what
+    # ZIP-based providers (Hubcap / oureveryday / Ryuu) drop manifests
+    # into after extraction. Without this, DDMod gets called with
+    # `-depot N` and no `-manifest N` and falls back to anonymous CDN
+    # fetch, which 401s on most owned-game depots and aborts. The user
+    # ends up with redists downloaded and zero game files.
+    try:
+        from sff.utils import manifests_staging_dir
+        staging = manifests_staging_dir()
+        if staging.exists():
+            staged: dict[str, str] = {}
+            for f in staging.glob("*.manifest"):
+                parts = f.stem.split("_", 1)
+                if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit():
+                    staged[parts[0]] = parts[1]
+            for depot_id in selected_depots:
+                key = str(depot_id)
+                if key not in manifests and key in staged:
+                    manifests[key] = staged[key]
+                    print_fn(
+                        Fore.CYAN
+                        + f"  [staging] picked up manifest {staged[key]} for depot {key}"
+                        + Style.RESET_ALL
+                    )
+    except Exception as exc:
+        print_fn(
+            Fore.YELLOW
+            + f"  [staging] could not scan staging dir ({exc}); continuing without auto-fill"
+            + Style.RESET_ALL
+        )
 
     dotnet_path = get_dotnet_path()
     if not dotnet_path:

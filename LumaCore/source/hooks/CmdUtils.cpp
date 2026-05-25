@@ -1,3 +1,8 @@
+// LumaCore — Steam client hook layer for SteaMidra.
+// Copyright (c) 2025-2026 Midrag (https://github.com/Midrags).
+// Distributed under the GNU General Public License v3 or later.
+// See <https://www.gnu.org/licenses/> for the full license text.
+
 #include "IPCBus.h"
 #include "CmdUtils.h"
 #include "CmdUser.h"
@@ -44,7 +49,7 @@ namespace {
         if (current == realAppId) return;
 
         *reinterpret_cast<AppId_t*>(pWrite->Base() + 1) = realAppId;
-        LOG_IPC_INFO("GetAppID: spoof response {} -> {}", current, realAppId);
+        LOG_IPCCH_INFO("GetAppID: spoof response {} -> {}", current, realAppId);
     }
 
     // ════════════════════════════════════════════════════════════════
@@ -57,7 +62,7 @@ namespace {
         AppId_t appId = CmdUser::LookupEticketAsyncCall(hAsyncCall);
         if (!appId) return false;
 
-        LOG_IPC_DEBUG("GetAPICallResult: EncryptedAppTicketResponse hAsyncCall=0x{:016X} "
+        LOG_IPCCH_DEBUG("GetAPICallResult: EncryptedAppTicketResponse hAsyncCall=0x{:016X} "
                   "AppId={} - injecting k_EResultOK", hAsyncCall, appId);
 
         if (!WriteCallbackResponse<EncryptedAppTicketResponse_t>(pWrite, [](auto& cb) {
@@ -87,7 +92,7 @@ namespace {
             pRead->Base() + IPC_ARGS_OFFSET);
 
         AppId_t appId = SteamCapture::GetAppIDForCurrentPipe();
-        LOG_IPC_DEBUG("GetAPICallResult: hAsyncCall=0x{:016X} AppId={} iCallback={} cubCallback={}",
+        LOG_IPCCH_DEBUG("GetAPICallResult: hAsyncCall=0x{:016X} AppId={} iCallback={} cubCallback={}",
                   req->hSteamAPICall, appId, req->iCallbackExpected, req->cubCallback);
         for (auto& entry : g_GacrDispatch) {
             if (entry.callbackId == req->iCallbackExpected) {

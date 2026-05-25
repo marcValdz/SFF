@@ -42,15 +42,15 @@ LINUX_RELEASE_ASSET_NAME = "emu-linux-release.tar.bz2"
 # files we need from the Windows release archive
 REQUIRED_FILES = {
     # regular mode — experimental builds (include overlay support, ~19 MB)
-    "steam_api.dll":              "release/experimental/x32/steam_api.dll",
+    "steam_api.dll":              "release/experimental/x86/steam_api.dll",
     "steam_api64.dll":            "release/experimental/x64/steam_api64.dll",
     # coldclient mode — full steamclient emulator (~19 MB)
     "steamclient.dll":            "release/steamclient_experimental/steamclient.dll",
     "steamclient64.dll":          "release/steamclient_experimental/steamclient64.dll",
-    "steamclient_loader_x32.exe": "release/steamclient_experimental/steamclient_loader_x32.exe",
+    "steamclient_loader_x86.exe": "release/steamclient_experimental/steamclient_loader_x86.exe",
     "steamclient_loader_x64.exe": "release/steamclient_experimental/steamclient_loader_x64.exe",
     # extra DLLs for coldclient injection
-    "steamclient_extra_x32.dll":  "release/steamclient_experimental/extra_dlls/steamclient_extra_x32.dll",
+    "steamclient_extra_x86.dll":  "release/steamclient_experimental/extra_dlls/steamclient_extra_x86.dll",
     "steamclient_extra_x64.dll":  "release/steamclient_experimental/extra_dlls/steamclient_extra_x64.dll",
     # overlay renderer — required when any overlay is enabled in steam_settings
     "GameOverlayRenderer.dll":    "release/steamclient_experimental/GameOverlayRenderer.dll",
@@ -59,7 +59,7 @@ REQUIRED_FILES = {
 
 # generate_interfaces tool (Windows)
 TOOLS_FILES = {
-    "generate_interfaces_x32.exe": "release/tools/generate_interfaces/generate_interfaces_x32.exe",
+    "generate_interfaces_x86.exe": "release/tools/generate_interfaces/generate_interfaces_x86.exe",
     "generate_interfaces_x64.exe": "release/tools/generate_interfaces/generate_interfaces_x64.exe",
 }
 
@@ -67,15 +67,15 @@ TOOLS_FILES = {
 # key = dest filename in cache; value = path inside the archive
 LINUX_REQUIRED_FILES = {
     "libsteam_api.so":   "release/regular/x64/libsteam_api.so",
-    "libsteam_api32.so": "release/regular/x32/libsteam_api.so",  # same filename, different dir
+    "libsteam_api32.so": "release/regular/x86/libsteam_api.so",  # same filename, different dir
     "steamclient.so":    "release/regular/x64/steamclient.so",
-    "steamclient32.so":  "release/regular/x32/steamclient.so",
+    "steamclient32.so":  "release/regular/x86/steamclient.so",
 }
 
 # Linux generate_interfaces tools
 LINUX_TOOLS_FILES = {
     "generate_interfaces_x64": "release/tools/generate_interfaces/generate_interfaces_x64",
-    "generate_interfaces_x32": "release/tools/generate_interfaces/generate_interfaces_x32",
+    "generate_interfaces_x86": "release/tools/generate_interfaces/generate_interfaces_x86",
 }
 
 

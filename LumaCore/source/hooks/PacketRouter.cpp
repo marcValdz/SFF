@@ -1,3 +1,8 @@
+// LumaCore - Steam client hook layer for SteaMidra.
+// Copyright (c) 2025-2026 Midrag (https://github.com/Midrags).
+// Distributed under the GNU General Public License v3 or later.
+// See <https://www.gnu.org/licenses/> for the full license text.
+
 #include "PacketRouter.h"
 #include "SteamCapture.h"
 #include "RichPresence.h"
@@ -10,12 +15,20 @@
 
 #include "steam_messages.pb.h"
 
-// ════════════════════════════════════════════════════════════════
-//  Shared infrastructure
-// ════════════════════════════════════════════════════════════════
+// ▌▌ LumaCore ▌ WIRE ▌ Shared infrastructure
+// ▌▌
 namespace {
 
-    constexpr uint32 kMaxBodySize   = 8092;
+    // 6.2.4 hotfix: bumped from 8092 to 262144 (256 KB) to accommodate
+    // big achievement schemas. Games like Black Myth: Wukong (147 KB),
+    // LEGO Batman, Schedule I etc. ship 50+ achievements with 16+
+    // localized strings each — the modified body easily exceeds 8 KB
+    // even after clear_stats(). With the old 8 KB ceiling the response
+    // either truncated to garbage (corrupted Steam's local schema
+    // cache) or fell through to pass-through (let dummy-account
+    // unlocks bleed into the local cache). 256 KB covers every
+    // achievement-related response we've seen on the wire.
+    constexpr uint32 kMaxBodySize   = 262144;
     constexpr uint32 kMaxHdrSize    = 1024;
     constexpr uint32 kMaxPacketSize = 8 + kMaxHdrSize + kMaxBodySize;
     constexpr int    kPacketPoolSize = 8;
@@ -124,16 +137,14 @@ namespace {
     }
 
     // ── Hash constants for target_job_name dispatch ─────────────
-    constexpr uint32 HASH_JOB_NotifyRunningApps      = LcHash32("FamilyGroupsClient.NotifyRunningApps#1");
-    constexpr uint32 HASH_JOB_GetUserStats            = LcHash32("Player.GetUserStats#1");
+    constexpr uint32 HASH_JOB_NotifyRunningApps      = LcFnvHash("FamilyGroupsClient.NotifyRunningApps#1");
+    constexpr uint32 HASH_JOB_GetUserStats            = LcFnvHash("Player.GetUserStats#1");
 } // anonymous namespace
 
 
-// ════════════════════════════════════════════════════════════════
-//  AccessToken
-//
+// ▌▌ LumaCore ▌ WIRE ▌ AccessToken
 //  Outgoing: CMsgClientPICSProductInfoRequest (eMsg 8903)
-// ════════════════════════════════════════════════════════════════
+// ▌▌
 namespace AccessToken {
 
     bool HandleSend(const uint8* pBody, uint32 cbBody)
@@ -196,14 +207,12 @@ namespace AccessToken {
 } // namespace AccessToken
 
 
-// ════════════════════════════════════════════════════════════════
-//  UserStats
-//
+// ▌▌ LumaCore ▌ WIRE ▌ UserStats
 //  Outgoing: CPlayer_GetUserStats_Request  (eMsg 151 -> target: Player.GetUserStats#1)
 //            CMsgClientGetUserStats        (eMsg 818)
-//  Incoming: CPlayer_GetUserStats_Response (eMsg 147 ← target: Player.GetUserStats#1)
+//  Incoming: CPlayer_GetUserStats_Response (eMsg 147 <- target: Player.GetUserStats#1)
 //            CMsgClientGetUserStatsResponse(eMsg 819)
-// ════════════════════════════════════════════════════════════════
+// ▌▌
 namespace UserStats {
 
     // jobid_source -> {appid, insert_time} mapping (eMsg 151 request -> eMsg 147 response)
@@ -211,9 +220,15 @@ namespace UserStats {
     using JobEntry = std::pair<AppId_t, std::chrono::steady_clock::time_point>;
     std::unordered_map<uint64, JobEntry> g_JobIdToAppId;
 
-    // Per-appId index into the SteamID pool — advances when a response comes back
-    // with no achievement data, so the next request tries the next account.
-    std::unordered_map<AppId_t, size_t> g_StatSteamIdIdx;
+    // 6.2.4 hotfix: per-appid "we just spoofed an 818 for this game"
+    // tracker. EMsg 819 has no jobid correlation, so we record the appid
+    // when 818 send actually spoofs and only strip the matching 819
+    // response. Without this gate the strip ran on pass-through requests
+    // too (where Steam already had a cached schema) and told Steam every
+    // configured game had 0 unlocks. TTL-prune keeps the map bounded
+    // even if a request never gets a matching response.
+    std::unordered_map<AppId_t, std::chrono::steady_clock::time_point> g_PendingClientStatsSpoof;
+    std::mutex g_PendingClientStatsSpoofMutex;
 
     // ── Send: CPlayer_GetUserStats_Request (eMsg 151) ──────────
     bool HandleSend_GetUserStats(const uint8* pBody, uint32 cbBody,
@@ -233,23 +248,30 @@ namespace UserStats {
         LOG_ACHIEVEMENT_DEBUG("Player::GetUserStats request: original body:\n{}", req.DebugString());
         
         AppId_t appId = req.appid();
+        // -onlinefix masquerade: the wire reports app 480 (Spacewar)
+        // because SpawnProcess rewrote pGameID. Redirect to the real
+        // appid so the depot check, the spoof rewrite, and the body
+        // we serialise all see the real game.
+        AppId_t realAppId = SteamCapture::ResolveAppId();
+        if (appId == kOnlineFixAppId
+            && realAppId != 0
+            && realAppId != kOnlineFixAppId) {
+            LOG_ACHIEVEMENT_INFO(
+                "Player::GetUserStats request: -onlinefix redirect appid {} -> {}",
+                appId, realAppId);
+            appId = realAppId;
+            req.set_appid(realAppId);
+        }
         if (!LuaLoader::HasDepot(appId)) {
             LOG_ACHIEVEMENT_WARN("Player::GetUserStats request: appid={} is not in addappid", appId);
             return false;
         }
 
-        // Drop the cached-schema digest and CRC.  When sha_schema is present
-        // Steam's server short-circuits with eresult=2 (no update / no
-        // license) instead of returning a fresh schema, leaving the
-        // achievement panel blank for fake-owned games.  Clearing both forces
-        // a full schema fetch which we then sanitize in the response handler.
-        if (req.has_sha_schema() && !req.sha_schema().empty()) {
-            LOG_ACHIEVEMENT_DEBUG("Player::GetUserStats request: clearing sha_schema for appid={}", appId);
-            req.clear_sha_schema();
-        }
-        if (req.has_crc_stats() && req.crc_stats() != 0) {
-            req.set_crc_stats(0);
-        }
+        // Widen the spoof gate for fake-owned appids: clear sha_schema so the
+        // server returns a populated schema instead of eresult=2. The
+        // schema-wipe-on-disk concern is gone (the wipe was removed in a prior
+        // fix), so re-clearing sha_schema is safe again.
+        req.clear_sha_schema();
 
         // Save jobid_source -> appid for the response handler
         CMsgProtoBufHeader hdr;
@@ -263,12 +285,12 @@ namespace UserStats {
             LOG_ACHIEVEMENT_DEBUG("Player::GetUserStats request: stored jobid={} -> appid={}", jobId, appId);
         }
 
-        size_t poolCount = 0;
-        const uint64_t* pool = LuaLoader::GetStatSteamIdPool(appId, poolCount);
-        size_t idx = g_StatSteamIdIdx[appId] % poolCount;
-        uint64_t newSteamId = pool[idx];
+        // Single stable stat steamid per appid, no pool cycling. Cycling
+        // gave Steam a different dummy account on every retry and confused
+        // the local cache.
+        uint64_t newSteamId = LuaLoader::GetStatSteamId(appId);
         req.set_steamid(newSteamId);
-        LOG_ACHIEVEMENT_DEBUG("Player::GetUserStats request: using pool[{}]={} for appid={}", idx, newSteamId, appId);
+        LOG_ACHIEVEMENT_DEBUG("Player::GetUserStats request: spoof steamid={} for appid={}", newSteamId, appId);
 
         g_TxBodyLen = static_cast<uint32>(req.ByteSizeLong());
         if (g_TxBodyLen > kMaxBodySize) {
@@ -336,15 +358,30 @@ namespace UserStats {
         if (g_RxHdrLen > kMaxHdrSize || !hdrMsg.SerializeToArray(g_RxHdr, kMaxHdrSize))
             return;
         LOG_ACHIEVEMENT_DEBUG("Player::GetUserStats response: modified header:\n{}", hdrMsg.DebugString());
-        g_PatchRxHdr = true;
 
         // Body: strip stats so the UI doesn't render dummy-account unlocks.
         resp.clear_stats();
-        g_RxBodyLen = static_cast<uint32>(resp.ByteSizeLong());
+        // 6.2.4 hotfix: bail to pass-through when the modified body
+        // would overflow kMaxBodySize. Big schemas (LEGO Batman with
+        // 50+ achievements * 16+ localized strings, etc) easily exceed
+        // 8 KB. Silent truncation produced a malformed protobuf that
+        // Steam wrote into its schema cache as zero achievements,
+        // blanking the panel. Also flip g_PatchRxHdr only after the
+        // body re-serialize actually succeeds, so a body failure can
+        // never leave a patched header dangling.
+        size_t newLen147 = resp.ByteSizeLong();
+        if (newLen147 > kMaxBodySize) {
+            LOG_ACHIEVEMENT_WARN(
+                "Player::GetUserStats response: appid={} modified size {} > {} buffer; pass-through to keep schema cache intact",
+                appId, newLen147, kMaxBodySize);
+            return;
+        }
+        g_RxBodyLen = static_cast<uint32>(newLen147);
         if (!resp.SerializeToArray(g_RxBody, kMaxBodySize)) {
             LOG_ACHIEVEMENT_WARN("Player::GetUserStats response: failed to SerializeToArray modified response");
             return;
         }
+        g_PatchRxHdr = true;
         g_PatchRx = true;
 
         LOG_ACHIEVEMENT_DEBUG("Player::GetUserStats response: modified body:\n{}", resp.DebugString());
@@ -365,37 +402,48 @@ namespace UserStats {
             return false;
         }
         AppId_t appId = static_cast<AppId_t>(req.game_id());
+        // -onlinefix masquerade: the wire reports app 480 (Spacewar)
+        // because SpawnProcess rewrote pGameID. Redirect to the real
+        // appid so the depot check, the spoof rewrite, and the body
+        // we serialise all see the real game.
+        AppId_t realAppId = SteamCapture::ResolveAppId();
+        if (appId == kOnlineFixAppId
+            && realAppId != 0
+            && realAppId != kOnlineFixAppId) {
+            LOG_ACHIEVEMENT_INFO(
+                "ClientGetUserStats request: -onlinefix redirect game_id {} -> {}",
+                appId, realAppId);
+            appId = realAppId;
+            req.set_game_id(realAppId);
+        }
         if (!LuaLoader::HasDepot(appId)) {
             LOG_ACHIEVEMENT_WARN("ClientGetUserStats request: appid={} is not in addappid", appId);
             return false;
         }
+        // appid in addappid means fresh-fetch rewrite, no cache-token gate.
+        // The on-disk wipe is gone, so we cannot trust the local crc to
+        // match what we will spoof. Wipe crc_stats and force
+        // schema_local_version=-1 every time so the server cannot
+        // short-circuit with eresult=2 on a stale validation token.
+        req.clear_crc_stats();
+        req.set_schema_local_version(-1);
 
-        // Force a full-schema fetch.  The user's stats DB on disk caches a
-        // schema_local_version per app; if Steam sends that version Steam
-        // servers reply with eresult=2 (no update / no license) and an empty
-        // body, leaving the achievement panel blank for fake-owned games.
-        // Setting it to -1 makes the server treat this as a first fetch and
-        // return the full schema, which we then sanitize in the response
-        // handler (stats wiped, achievement_blocks cleared, eresult forced
-        // to OK).  Skip games already known to be genuinely owned — those
-        // exit earlier via HasDepot=false above.
-        if (req.has_schema_local_version() && req.schema_local_version() != -1) {
-            LOG_ACHIEVEMENT_DEBUG("ClientGetUserStats request: forcing schema_local_version {} -> -1 for appid={}",
-                                  req.schema_local_version(), appId);
-            req.set_schema_local_version(-1);
-        }
-        // Drop crc_stats so the server doesn't short-circuit on cached CRC.
-        if (req.has_crc_stats() && req.crc_stats() != 0) {
-            req.set_crc_stats(0);
-        }
+        // Single stable stat steamid per appid, no pool cycling.
+        uint64_t newSteamId = LuaLoader::GetStatSteamId(appId);
+        req.set_steam_id_for_user(newSteamId);
+        LOG_ACHIEVEMENT_DEBUG("ClientGetUserStats request: spoof steam_id_for_user={} for appid={}", newSteamId, appId);
 
+        // Mark this appid as "just spoofed" so the matching 819 response
+        // strips. The 819 handler keys off this set; pass-through
+        // requests (where Steam already had a cached schema) get
+        // pass-through responses, keeping the local cache intact.
         {
-            size_t poolCount = 0;
-            const uint64_t* pool = LuaLoader::GetStatSteamIdPool(appId, poolCount);
-            size_t idx = g_StatSteamIdIdx[appId] % poolCount;
-            uint64_t newSteamId = pool[idx];
-            req.set_steam_id_for_user(newSteamId);
-            LOG_ACHIEVEMENT_DEBUG("ClientGetUserStats request: using pool[{}]={} for appid={}", idx, newSteamId, appId);
+            std::lock_guard<std::mutex> guard(g_PendingClientStatsSpoofMutex);
+            auto now = std::chrono::steady_clock::now();
+            std::erase_if(g_PendingClientStatsSpoof, [&now](const auto& e) {
+                return now - e.second > std::chrono::seconds(30);
+            });
+            g_PendingClientStatsSpoof[appId] = now;
         }
 
         g_TxBodyLen = static_cast<uint32>(req.ByteSizeLong());
@@ -413,47 +461,91 @@ namespace UserStats {
     }
 
     // ── Recv: CMsgClientGetUserStatsResponse (eMsg 819) ────────
-    //     Strip stats(5) + achievement_blocks(6), patch eresult->OK.
+    //     Strip stats(5) + achievement_blocks(6), patch eresult->OK
+    //     ONLY when this response belongs to a request we just spoofed.
     //
-    // The request handler swapped steam_id_for_user with a pool dummy
-    // (in HandleSend_ClientGetUserStats), so when we receive a response with
-    // genuine stats they belong to the dummy account, NOT the local user.
-    // We must always strip those stats.
-    //
-    // The only case where we should pass through unmodified is when the
-    // request was NOT spoofed — but at this point we have no way to tell
-    // (we don't carry a per-jobid hint for the 818 path).  Keep stripping
-    // stats here; the duplicate-injection fix in PackagePatch ensures that
-    // genuinely-owned games hit MarkOwned via CheckAppOwnership and never
-    // reach this handler in the first place (HasDepot returns false for
-    // them, so we exit early via "no modification needed").
+    // EMsg 819 has no jobid correlation field, so we key off the
+    // game_id and the per-appid pending flag set by the send handler.
+    // Spoofed first-fetch responses get stripped (their stats belong
+    // to the dummy account). Pass-through responses (Steam had a local
+    // cache, schema_local_version != -1) get left alone so Steam keeps
+    // its own cache instead of being told the user has 0 unlocks.
     bool HandleRecv_ClientGetUserStatsResponse(const uint8* pBody, uint32 cbBody)
     {
         CMsgClientGetUserStatsResponse resp;
         if (!resp.ParseFromArray(pBody, cbBody))
             return false;
         LOG_ACHIEVEMENT_DEBUG("ClientGetUserStats response: original body:\n{}", resp.DebugString());
-        if(!resp.has_game_id() || !LuaLoader::HasDepot(static_cast<AppId_t>(resp.game_id()))) {
+        if (!resp.has_game_id()) {
+            LOG_ACHIEVEMENT_DEBUG("ClientGetUserStats response: no modification needed");
+            return false;
+        }
+        // -onlinefix masquerade: the wire reports app 480 (Spacewar).
+        // Resolve the real appid before the depot gate AND before the
+        // pending-spoof lookup so the matching 818 entry under the
+        // real appid actually gets found.
+        AppId_t gameId = static_cast<AppId_t>(resp.game_id());
+        AppId_t realAppId = SteamCapture::ResolveAppId();
+        if (gameId == kOnlineFixAppId
+            && realAppId != 0
+            && realAppId != kOnlineFixAppId) {
+            LOG_ACHIEVEMENT_INFO(
+                "ClientGetUserStats response: -onlinefix redirect game_id {} -> {}",
+                gameId, realAppId);
+            gameId = realAppId;
+        }
+        if (!LuaLoader::HasDepot(gameId)) {
             LOG_ACHIEVEMENT_DEBUG("ClientGetUserStats response: no modification needed");
             return false;
         }
 
-        AppId_t gameId = static_cast<AppId_t>(resp.game_id());
+
+        // Was the matching 818 spoofed? If not, this is pass-through.
+        bool wasSpoofed = false;
+        {
+            std::lock_guard<std::mutex> guard(g_PendingClientStatsSpoofMutex);
+            auto it = g_PendingClientStatsSpoof.find(gameId);
+            if (it != g_PendingClientStatsSpoof.end()) {
+                wasSpoofed = true;
+                g_PendingClientStatsSpoof.erase(it);
+            }
+        }
+        if (!wasSpoofed) {
+            LOG_ACHIEVEMENT_DEBUG(
+                "ClientGetUserStats response: appid={} pass-through (request was not spoofed), keep stats",
+                gameId);
+            return false;
+        }
 
         resp.clear_stats();
         resp.clear_achievement_blocks();
+        // 6.2.4 hotfix: also clear crc_stats. Steam writes whatever
+        // crc the server returns into <steam>/appcache/stats/
+        // UserGameStats_<accid>_<appid>.bin. With a non-zero crc and
+        // zero stats inside, Steam treats the cache as "valid empty"
+        // on next launch — sends 818 with that crc, server returns
+        // eresult=2 (no update), pass-through, Steam shows the empty
+        // cache. The achievement panel goes blank on every restart.
+        // Clearing crc here makes Steam re-fetch on every launch so
+        // the spoofed schema (with all achievement names / icons)
+        // always comes back fresh.
+        resp.clear_crc_stats();
         resp.set_eresult(1);  // k_EResultOK
-        LOG_ACHIEVEMENT_DEBUG("ClientGetUserStats response: clear stats and achievement_blocks, set eresult=OK");
+        LOG_ACHIEVEMENT_DEBUG("ClientGetUserStats response: clear stats/achievement_blocks/crc_stats, set eresult=OK");
 
-        // Advance pool index for next request — try next SteamID if this one had no schema
-        {
-            size_t poolCount = 0;
-            LuaLoader::GetStatSteamIdPool(gameId, poolCount);
-            if (poolCount > 1)
-                g_StatSteamIdIdx[gameId] = (g_StatSteamIdIdx[gameId] + 1) % poolCount;
+        // 6.2.4 hotfix: bail to pass-through when the modified body
+        // overflows kMaxBodySize. LEGO Batman / Schedule I / similar
+        // big-schema games hit this; silent truncation corrupted
+        // Steam's local schema cache and the overlay panel rendered
+        // 0 / 52 unlocks until the cache file was deleted by hand.
+        size_t newLen819 = resp.ByteSizeLong();
+        if (newLen819 > kMaxBodySize) {
+            LOG_ACHIEVEMENT_WARN(
+                "ClientGetUserStats response: appid={} modified size {} > {} buffer; pass-through to keep schema cache intact",
+                gameId, newLen819, kMaxBodySize);
+            return false;
         }
-
-        g_RxBodyLen = static_cast<uint32>(resp.ByteSizeLong());
+        g_RxBodyLen = static_cast<uint32>(newLen819);
         if (!resp.SerializeToArray(g_RxBody, kMaxBodySize))
             return false;
         LOG_ACHIEVEMENT_DEBUG("ClientGetUserStats response: modified body:\n{}", resp.DebugString());
@@ -463,11 +555,9 @@ namespace UserStats {
 } // namespace UserStats
 
 
-// ════════════════════════════════════════════════════════════════
-//  ETicket
-//
+// ▌▌ LumaCore ▌ WIRE ▌ ETicket
 //  Incoming: CMsgClientRequestEncryptedAppTicketResponse (eMsg 5527)
-// ════════════════════════════════════════════════════════════════
+// ▌▌
 namespace ETicket {
 
     void HandleEncryptedAppTicketResponse(const uint8* pBody, uint32 cbBody)
@@ -512,9 +602,7 @@ namespace ETicket {
 } // namespace ETicket
 
 
-// ════════════════════════════════════════════════════════════════
-//  AppOwnershipTicketResponse (debug-only inspector for now)
-//
+// ▌▌ LumaCore ▌ WIRE ▌ AppOwnershipTicketResponse (debug-only inspector for now)
 //  Incoming: CMsgClientGetAppOwnershipTicketResponse  (eMsg 858)
 //  Outgoing: CMsgClientGetAppOwnershipTicket          (eMsg 857)
 //
@@ -524,10 +612,10 @@ namespace ETicket {
 //  payload. Steam then refuses to launch DRM-wrapped games (error 54).
 //
 //  This handler exists right now only to dump the raw response so we
-//  can see exactly what the server is sending. No patching yet — once
+//  can see exactly what the server is sending. No patching yet; once
 //  the wire format is confirmed we will build a forged success reply
 //  here using the cached registry blob.
-// ════════════════════════════════════════════════════════════════
+// ▌▌
 namespace AppOwnershipTicketResp {
 
     void HandleSend(const uint8* pBody, uint32 cbBody)
@@ -576,9 +664,8 @@ namespace AppOwnershipTicketResp {
 } // namespace AppOwnershipTicketResp
 
 
-// ════════════════════════════════════════════════════════════════
-//  FamilySharing
-// ════════════════════════════════════════════════════════════════
+// ▌▌ LumaCore ▌ WIRE ▌ FamilySharing
+// ▌▌
 namespace FamilySharing {
 
     void ClearBody(const uint8*, uint32)
@@ -593,15 +680,13 @@ namespace FamilySharing {
 
 
 
-// ════════════════════════════════════════════════════════════════
-//  OnlineFix
-//
+// ▌▌ LumaCore ▌ WIRE ▌ OnlineFix
 //  Outgoing: CMsgClientGamesPlayed (eMsg 742 / 5410)
 //
 //  When a game launched with -onlinefix reports appid 480, replace
 //  game_extra_info with the real game's localized name so friends
 //  see the correct title.
-// ════════════════════════════════════════════════════════════════
+// ▌▌
 namespace OnlineFix {
 
     bool HandleSend(const uint8* pBody, uint32 cbBody)
@@ -674,9 +759,8 @@ namespace OnlineFix {
 } // namespace OnlineFix
 
 
-// ════════════════════════════════════════════════════════════════
-//  Dispatch
-// ════════════════════════════════════════════════════════════════
+// ▌▌ LumaCore ▌ WIRE ▌ Dispatch
+// ▌▌
 namespace {
 
     bool SendServiceJob(const char* targetJobName,
@@ -684,7 +768,7 @@ namespace {
                         const uint8* pHdr, uint32 cbHdr)
     {
         LOG_NETPACKET_DEBUG("Send target_job_name: {}", targetJobName);
-        switch (LcHash32(targetJobName)) {
+        switch (LcFnvHash(targetJobName)) {
 
         case HASH_JOB_GetUserStats:
             return UserStats::HandleSend_GetUserStats(pBody, cbBody, pHdr, cbHdr);
@@ -743,7 +827,7 @@ namespace {
         g_PatchRx = false;
         g_PatchRxHdr  = false;
 
-        switch (LcHash32(targetJobName)) {
+        switch (LcFnvHash(targetJobName)) {
 
         case HASH_JOB_NotifyRunningApps:
             FamilySharing::ClearBody(pBody, cbBody);
@@ -823,9 +907,8 @@ namespace {
         }
     }
 
-    // ════════════════════════════════════════════════════════════
-    //  Hooks
-    // ════════════════════════════════════════════════════════════
+    // ▌ WIRE ▌ Hooks
+    // ▌
 
     LC_HOOK_DEF(BBuildAndAsyncSendFrame, bool,
               void* pObject, EWebSocketOpCode eWebSocketOpCode,

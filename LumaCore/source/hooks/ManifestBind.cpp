@@ -1,17 +1,21 @@
+// LumaCore — Steam client hook layer for SteaMidra.
+// Copyright (c) 2025-2026 Midrag (https://github.com/Midrags).
+// Distributed under the GNU General Public License v3 or later.
+// See <https://www.gnu.org/licenses/> for the full license text.
+
 #include "ManifestBind.h"
 #include "Macros.h"
 #include "entry.h"
 #include <format>
 #include <string>
 
-// ═══════════════════════════════════════════════════════════════════
-//  Manifest override hooks:
-//    BuildDepotDependency — patches depot entries' gid/size directly
-//      in the output vector.
-// ═══════════════════════════════════════════════════════════════════
+// ▌▌ LumaCore ▌ MANIFEST ▌ Manifest override hooks
+//  BuildDepotDependency patches depot entries' gid/size directly in the
+//  output vector after Steam builds the depot list.
+// ▌▌
 namespace {
 
-    // ── helper ─────────────────────────────────────────────────────
+    // ▌ MANIFEST ▌ helper
 
     std::string DepotStr(const DepotEntry& e) {
         return std::format("[DepotId={} | AppId={} | Gid={} | Size={} | Dlc={} | Lcs={} | Carry={} | Shared={}]",
@@ -19,7 +23,7 @@ namespace {
             (int)e.LcsRequired, (int)e.bNotNewTarget, (int)e.SharedInstall);
     }
 
-    // ── BuildDepotDependency hook ──────────────────────────────────
+    // ▌ MANIFEST ▌ BuildDepotDependency hook
     // After Steam builds the depot list for an app, patch ManifestGid
     // and ManifestSize for any depots we have overrides for.
 
@@ -28,29 +32,29 @@ namespace {
               CUtlVector<DepotEntry>* pSharedDepotInfo, void* pSteamApp,
               uint32* pBuildId, bool* pbBetaFallback)
     {
-        bool result = oBuildDepotDependency(pUserAppMgr, AppId, pUserConfig,
+        bool outcome = oBuildDepotDependency(pUserAppMgr, AppId, pUserConfig,
             pDepotInfo, pSharedDepotInfo, pSteamApp, pBuildId, pbBetaFallback);
 
-        LOG_MANIFEST_TRACE("BuildDepotDependency: AppId={} pUserConfig=0x{:X} result={} pSteamApp=0x{:X} pBuildId={} pbBetaFallback={}",
-            AppId, (uintptr_t)pUserConfig, result, (uintptr_t)pSteamApp,
+        LOG_MANIFESTCH_TRACE("BuildDepotDependency: AppId={} pUserConfig=0x{:X} result={} pSteamApp=0x{:X} pBuildId={} pbBetaFallback={}",
+            AppId, (uintptr_t)pUserConfig, outcome, (uintptr_t)pSteamApp,
             pBuildId ? *pBuildId : 0, pbBetaFallback ? *pbBetaFallback : false);
         if (pDepotInfo) {
-            LOG_MANIFEST_TRACE("pDepotInfo->nCount={}", pDepotInfo->m_Size);
+            LOG_MANIFESTCH_TRACE("pDepotInfo->nCount={}", pDepotInfo->m_Size);
             const DepotEntry* dBase = pDepotInfo->m_Memory.m_pMemory;
             for (uint32 n = 0; n < pDepotInfo->m_Size; ++n)
-                LOG_MANIFEST_TRACE("  [{}] {}", n, DepotStr(dBase[n]));
+                LOG_MANIFESTCH_TRACE("  [{}] {}", n, DepotStr(dBase[n]));
         }
         if (pSharedDepotInfo) {
-            LOG_MANIFEST_TRACE("pSharedDepotInfo->nCount={}", pSharedDepotInfo->m_Size);
+            LOG_MANIFESTCH_TRACE("pSharedDepotInfo->nCount={}", pSharedDepotInfo->m_Size);
             const DepotEntry* sBase = pSharedDepotInfo->m_Memory.m_pMemory;
             for (uint32 n = 0; n < pSharedDepotInfo->m_Size; ++n)
-                LOG_MANIFEST_TRACE("  shared[{}] {}", n, DepotStr(sBase[n]));
+                LOG_MANIFESTCH_TRACE("  shared[{}] {}", n, DepotStr(sBase[n]));
         }
 
-        if (!result) return result;
+        if (!outcome) return outcome;
 
         const auto& overrides = LuaLoader::GetManifestOverrides();
-        if (overrides.empty()) return result;
+        if (overrides.empty()) return outcome;
 
         if (pDepotInfo && pDepotInfo->m_Size) {
             DepotEntry* pBegin = pDepotInfo->m_Memory.m_pMemory;
@@ -60,7 +64,7 @@ namespace {
                 if (it != overrides.end()) {
                     // if size=0 in the override, keep the original size(affects download display but not the actual download)
                     uint64_t newSize = it->second.size ? it->second.size : ep->ManifestSize;
-                    LOG_MANIFEST_INFO("BuildDepotDependency: patching depot {} gid={}->{} size={}->{}",
+                    LOG_MANIFESTCH_INFO("BuildDepotDependency: patching depot {} gid={}->{} size={}->{}",
                         ep->DepotId, ep->ManifestGid, it->second.gid,
                         ep->ManifestSize, newSize);
                     ep->ManifestGid  = it->second.gid;
@@ -68,7 +72,7 @@ namespace {
                 }
             }
         }
-        return result;
+        return outcome;
     }
 
 } // anonymous namespace

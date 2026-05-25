@@ -91,6 +91,26 @@ def get_oureverday(dest, app_id):
         print(Fore.RED + f"No valid depots exist on Steam for this App ID." + Style.RESET_ALL)
         return None
 
+    # Pull every DLC app id Steam reports for this game from extended.listofdlc.
+    # These are DLCs with no depot of their own (cosmetic, soundtrack, in-game
+    # currency, etc) — the keyed addappid(depot, 1, "key") lines won't cover
+    # them because they have no depot_id. Adding plain addappid(<dlc_id>) lines
+    # tells LumaCore to mark them as owned without any depot data.
+    dlc_app_ids: list[str] = []
+    try:
+        listofdlc = (
+            app_info.get("extended", {}).get("listofdlc", "")
+            if isinstance(app_info.get("extended"), dict) else ""
+        )
+        if isinstance(listofdlc, str) and listofdlc.strip():
+            dlc_app_ids = [
+                x.strip()
+                for x in listofdlc.split(",")
+                if x.strip().isdigit()
+            ]
+    except Exception:
+        dlc_app_ids = []
+
     # Step 2: Bundled local key database
     print(Fore.CYAN + f"[Step 2] Loading bundled key database..." + Style.RESET_ALL)
     keys_dict = {}
@@ -142,6 +162,12 @@ def get_oureverday(dest, app_id):
                                 lua_lines.append(f"addappid({d}, 1, \"{keys_dict[d]}\")")
                                 found += 1
                         if found > 0:
+                            # Append every depotless DLC the game declares so
+                            # LumaCore marks them as owned alongside the keyed
+                            # depots above.
+                            for dlc_id in dlc_app_ids:
+                                if dlc_id != str(app_id) and dlc_id not in depots:
+                                    lua_lines.append(f"addappid({dlc_id})")
                             lua_path = dest / f"{app_id}.lua"
                             lua_path.write_text("\n".join(lua_lines), encoding="utf-8")
                             print(Fore.GREEN + f"\u2705 Built Lua for {app_id} using revobd.club keys ({found} depot(s))" + Style.RESET_ALL)
@@ -151,11 +177,24 @@ def get_oureverday(dest, app_id):
             print(Fore.YELLOW + f"revobd.club unreachable ({e})." + Style.RESET_ALL)
         return None
 
+    # Append every depotless DLC the game declares so LumaCore marks them as
+    # owned alongside the keyed depots above. Skipping the base appid and any
+    # id that already appears as a depot avoids duplicates.
+    appended_dlcs = 0
+    for dlc_id in dlc_app_ids:
+        if dlc_id == str(app_id) or dlc_id in depots:
+            continue
+        lua_lines.append(f"addappid({dlc_id})")
+        appended_dlcs += 1
+
     lua_path = dest / f"{app_id}.lua"
     with lua_path.open("w", encoding="utf-8") as f:
         f.write("\n".join(lua_lines))
 
-    print(Fore.GREEN + f"[OK] Built custom Lua for {app_id} (Resolved {found} keys natively)" + Style.RESET_ALL)
+    if appended_dlcs:
+        print(Fore.GREEN + f"[OK] Built custom Lua for {app_id} (Resolved {found} keys natively, +{appended_dlcs} DLC appid(s))" + Style.RESET_ALL)
+    else:
+        print(Fore.GREEN + f"[OK] Built custom Lua for {app_id} (Resolved {found} keys natively)" + Style.RESET_ALL)
     return lua_path
 
 
@@ -327,9 +366,19 @@ def get_ryuu(dest, app_id, depotcache=None, request_update=None):
                     msg = upd_resp.json().get("message", "OK")
                     print(Fore.GREEN + f"Ryuu update: {msg}" + Style.RESET_ALL)
                 elif upd_resp.status_code == 400:
-                    print(Fore.YELLOW + "Ryuu: Game not found for update request." + Style.RESET_ALL)
+                    body = (upd_resp.text or "")[:4096]
+                    print(
+                        Fore.YELLOW
+                        + f"ryuu rejected update: 400 (appid not in db) {body}"
+                        + Style.RESET_ALL
+                    )
                 else:
-                    print(Fore.YELLOW + f"Ryuu update request returned HTTP {upd_resp.status_code}." + Style.RESET_ALL)
+                    body = (upd_resp.text or "")[:4096]
+                    print(
+                        Fore.YELLOW
+                        + f"ryuu rejected update: {upd_resp.status_code} {body}"
+                        + Style.RESET_ALL
+                    )
             except Exception as e:
                 print(Fore.YELLOW + f"Ryuu update request failed ({e}). Continuing with download..." + Style.RESET_ALL)
             request_update = False
@@ -354,15 +403,21 @@ def get_ryuu(dest, app_id, depotcache=None, request_update=None):
             return None
 
         if resp.status_code == 404:
-            print(Fore.RED + f"Ryuu: Game not found (App ID {app_id})." + Style.RESET_ALL)
+            body = (resp.text or "")[:4096]
+            print(
+                Fore.RED
+                + f"ryuu rejected: 404 (App ID {app_id} not found) {body}"
+                + Style.RESET_ALL
+            )
             return None
 
         if resp.status_code == 403:
             attempt += 1
+            body = (resp.text or "")[:4096]
             print(
                 Fore.RED
-                + f"Ryuu: Access denied (403) — API key rejected or subscription expired."
-                  f" (Attempt {attempt}/{max_attempts})"
+                + f"ryuu rejected: 403 — API key rejected or subscription expired."
+                  f" {body} (Attempt {attempt}/{max_attempts})"
                 + Style.RESET_ALL
             )
             if attempt >= max_attempts:
@@ -374,7 +429,12 @@ def get_ryuu(dest, app_id, depotcache=None, request_update=None):
             return None
 
         if resp.status_code != 200:
-            print(Fore.RED + f"Ryuu returned HTTP {resp.status_code}. Cannot recover." + Style.RESET_ALL)
+            body = (resp.text or "")[:4096]
+            print(
+                Fore.RED
+                + f"ryuu rejected: {resp.status_code} {body}"
+                + Style.RESET_ALL
+            )
             return None
 
         lua_bytes = read_lua_from_zip(io.BytesIO(resp.content), decode=False, depotcache=depotcache)

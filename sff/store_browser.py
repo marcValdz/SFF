@@ -41,6 +41,73 @@ class GameInfo:
     last_updated: str = ""
     status: str = ""
     size: int = 0
+    # Lowercase platform tags like "windows", "macos", "linux".
+    # Empty list means "Hubcap didn't report platforms for this game"
+    # and the caller should treat the entry as platform-agnostic
+    # (don't filter it out).
+    platforms: list = field(default_factory=list)
+
+
+def _parse_platforms(item):
+    """Extract a list of lowercase platform tags from a Hubcap row.
+
+    Hubcap responses use a few different shapes for platform info
+    across endpoints. Common shapes:
+
+      * `"platforms": ["windows", "macos"]` (list of strings)
+      * `"platforms": "windows,macos"` (csv string)
+      * `"oslist": "windows"` (Steam-style csv)
+      * per-platform booleans: `windows: true`, `macos: false`,
+        `linux: false`, plus the lowercase / capitalized variants
+        Hubcap's UI sometimes ships
+      * `"os_list": ["Windows"]`
+
+    Anything we can't parse returns []. The caller treats [] as
+    "platform unknown, keep the row" so we never drop entries the
+    server didn't tag.
+    """
+    if not isinstance(item, dict):
+        return []
+    out = []
+
+    def _add(val):
+        v = str(val).strip().lower()
+        if v in ("win", "win32", "win64"):
+            v = "windows"
+        elif v in ("mac", "osx", "os x", "macosx"):
+            v = "macos"
+        elif v in ("linux64", "steamos", "linux32"):
+            v = "linux"
+        if v in ("windows", "macos", "linux") and v not in out:
+            out.append(v)
+
+    for key in ("platforms", "platform", "oslist", "os_list", "os"):
+        val = item.get(key)
+        if not val:
+            continue
+        if isinstance(val, list):
+            for entry in val:
+                _add(entry)
+        elif isinstance(val, str):
+            for piece in val.replace("|", ",").split(","):
+                if piece.strip():
+                    _add(piece)
+
+    # Per-platform boolean flags. Keys vary in casing across
+    # Hubcap's responses (windows / Windows / WINDOWS etc.).
+    bool_keys = {
+        "windows": ("windows", "Windows", "WINDOWS", "win"),
+        "macos":   ("macos", "macOS", "Mac", "mac", "osx"),
+        "linux":   ("linux", "Linux", "LINUX"),
+    }
+    for plat, keys in bool_keys.items():
+        for k in keys:
+            v = item.get(k)
+            if v is True or (isinstance(v, str) and v.strip().lower() in ("true", "1", "yes")):
+                if plat not in out:
+                    out.append(plat)
+                break
+    return out
 
 
 @dataclass
@@ -137,6 +204,7 @@ class StoreApiClient:
                     last_updated=str(uploaded),
                     status="available" if manifest_ok else "",
                     size=int(item.get("manifest_size", 0) or 0),
+                    platforms=_parse_platforms(item),
                 ))
             return LibraryPage(
                 games=games,
@@ -176,6 +244,7 @@ class StoreApiClient:
                     name=gname,
                     last_updated=str(uploaded),
                     status="available" if manifest_ok else "",
+                    platforms=_parse_platforms(item),
                 ))
             return results
         except Exception as e:

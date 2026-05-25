@@ -452,7 +452,7 @@ class GoldbergApplier:
             else:
                 log(f"Warning: {sc_name} not found in cache")
         # deploy loader
-        loader_name = "steamclient_loader_x64.exe" if is_64 else "steamclient_loader_x32.exe"
+        loader_name = "steamclient_loader_x64.exe" if is_64 else "steamclient_loader_x86.exe"
         src = self.cache_dir / loader_name
         if src.exists():
             shutil.copy2(src, game_path / loader_name)
@@ -463,7 +463,7 @@ class GoldbergApplier:
         extra_dir = game_path / "extra_dlls"
         extra_dir.mkdir(exist_ok=True)
         # steamclient_extra DLL (gbe_fork companion — arch-correct)
-        extra_name = "steamclient_extra_x64.dll" if is_64 else "steamclient_extra_x32.dll"
+        extra_name = "steamclient_extra_x64.dll" if is_64 else "steamclient_extra_x86.dll"
         extra_src = self.cache_dir / extra_name
         if extra_src.exists():
             shutil.copy2(extra_src, extra_dir / extra_name)
@@ -471,6 +471,8 @@ class GoldbergApplier:
         else:
             log(f"Warning: {extra_name} not found in cache")
         # steamstub avoider DLL — bypasses SteamStub protection at runtime
+        # steamstub_x32 / x64 ship with steamautocrack only; gbe_fork no longer bundles them.
+        # _find_tool soft-fails if the DLL is missing.
         stub_name = "steamstub_x64.dll" if is_64 else "steamstub_x32.dll"
         stub_src = self._find_tool(stub_name)
         if stub_src:
@@ -702,8 +704,8 @@ SteamClient={'steamclient64.dll' if is_64 else 'steamclient.dll'}
         for name in [
             "ColdClientLoader.ini", "coldloader.ini", "coldloader.dll",
             "steamclient.dll", "steamclient64.dll",
-            "steamclient_loader_x32.exe", "steamclient_loader_x64.exe",
-            "steamclient_extra_x32.dll", "steamclient_extra_x64.dll",
+            "steamclient_loader_x32.exe", "steamclient_loader_x86.exe", "steamclient_loader_x64.exe",
+            "steamclient_extra_x32.dll", "steamclient_extra_x86.dll", "steamclient_extra_x64.dll",
             "steam_interfaces.txt",
             "GameOverlayRenderer.dll", "GameOverlayRenderer64.dll",
         ]:

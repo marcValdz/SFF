@@ -144,9 +144,47 @@ class SteamStubUnpacker:
             return 0
         # find all .exe files
         exe_files = [f for f in game_dir.rglob("*.exe") if not self._should_skip(f)]
-        log(f"Found {len(exe_files)} executable(s) to scan")
+        # 6.2.4: drop UE5 sub-bundle binaries that ship inside engine
+        # subfolders (CrashReportClient, EpicWebHelper, EOSOverlay, etc).
+        # They're never SteamStub-protected and the noise from
+        # "All unpackers failed" buried the real game-exe failure in
+        # the user log. Keep only exes one or two levels deep, plus the
+        # game's main launch exe even when nested under Binaries/Win64.
+        prioritized: list[Path] = []
+        for f in exe_files:
+            try:
+                rel_parts = f.relative_to(game_dir).parts
+            except ValueError:
+                rel_parts = f.parts
+            depth = len(rel_parts)
+            # Skip UE5 / Unity nested redistributables / crash handlers
+            # by directory name.
+            engine_markers = (
+                "Engine", "ThirdParty", "Redist", "Redistributable",
+                "EOSOverlayRenderer", "EpicWebHelper", "CrashReportClient",
+                "_CommonRedist", "Plugins",
+            )
+            if any(p in engine_markers for p in rel_parts[:-1]):
+                continue
+            # Drop tiny exes that are almost certainly stub launchers,
+            # uninstallers, or activation prompts. SteamStub-protected
+            # executables are typically >= 2 MB even on small games.
+            try:
+                if f.stat().st_size < 2 * 1024 * 1024 and depth > 2:
+                    continue
+            except OSError:
+                continue
+            prioritized.append(f)
+        # Common UE5 layout: <GameRoot>/<GameName>/Binaries/Win64/<Game>-Win64-Shipping.exe
+        # is the actual SteamStub-wrapped binary. Sort by size descending so
+        # the main exe lands first; success on it short-circuits the rest.
+        prioritized.sort(
+            key=lambda p: p.stat().st_size if p.exists() else 0,
+            reverse=True,
+        )
+        log(f"Found {len(exe_files)} executable(s); {len(prioritized)} eligible for SteamStub scan")
         unpacked_count = 0
-        for exe_path in exe_files:
+        for exe_path in prioritized:
             result = self.unpack_file(str(exe_path), log_func, use_experimental=use_experimental)
             if result:
                 unpacked_count += 1
@@ -171,19 +209,30 @@ class SteamStubUnpacker:
             # Steamless outputs to {name}.unpacked.exe by default
             unpacked_path = exe_path.with_name(exe_path.stem + ".unpacked.exe")
             # run Steamless (via wine on Linux)
-            cmd = [self.steamless_path, "--quiet"]
+            #
+            # Flag set chosen to maximise success rate on modern UE5 / x64
+            # titles. atom0s ships --realign and --recalcchecksum as part
+            # of the v3.0.0.13+ kit and SteamAutoCrack invokes them too.
+            # --exp turns on experimental variants for newer wrapper
+            # revisions that haven't been promoted to the main code path.
+            cmd = [self.steamless_path]
             if use_experimental:
                 cmd.append("--exp")
-            cmd.append(str(exe_path))
+            cmd.extend(["--realign", "--recalcchecksum", str(exe_path)])
             if sys.platform != "win32":
                 cmd = ["wine"] + cmd
             result = subprocess.run(
                 cmd,
                 capture_output=True,
                 text=True,
-                timeout=60,
+                timeout=120,
                 cwd=str(Path(self.steamless_path).parent),
             )
+            # Surface Steamless output on failure so users can see which
+            # variant tried and why. Without this every failed unpack
+            # looked identical regardless of root cause.
+            stdout = (result.stdout or "").strip()
+            stderr = (result.stderr or "").strip()
             # check if unpacked file was created
             if unpacked_path.exists():
                 # SteamStub was found and unpacked
@@ -193,10 +242,32 @@ class SteamStubUnpacker:
                 # replace with unpacked version
                 shutil.move(str(unpacked_path), str(exe_path))
                 return True
+            # Steamless ran without producing output. Two cases:
+            #   - "File has no SteamStub": expected, the exe isn't packed
+            #   - "All unpackers failed to unpack file": real failure on a
+            #     packed exe (header mismatch, unsupported variant, or a
+            #     file the user actually wants to know about).
+            failure_marker = "all unpackers failed"
+            no_stub_markers = ("not packed", "no .bind section", "is not packed")
+            looks_like_real_failure = (
+                failure_marker in stdout.lower()
+                or any(m in stdout.lower() for m in [
+                    "failed to unpack", "decryption failed", "unsupported header"
+                ])
+            )
+            looks_unprotected = any(m in stdout.lower() for m in no_stub_markers)
+            if looks_like_real_failure and not looks_unprotected:
+                log(f"× SteamStub unpack failed on {exe_path.name}")
+                if stdout:
+                    log(stdout[-1500:])
+                if stderr:
+                    log(stderr[-500:])
             else:
-                # Steamless didn't produce output = no SteamStub found
-                logger.debug("No SteamStub detected in %s", exe_path.name)
-                return False
+                logger.debug(
+                    "No SteamStub detected in %s (rc=%s)",
+                    exe_path.name, result.returncode,
+                )
+            return False
         except subprocess.TimeoutExpired:
             log(f"Steamless timed out on {exe_path.name}")
             return False

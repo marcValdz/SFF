@@ -108,3 +108,27 @@ class Updater:
         if not is_newer_version(remote_tag, VERSION):
             return False, release
         return True, release
+
+    @staticmethod
+    def fetch_release_notes(version):
+        # Hits the GitHub release-by-tag endpoint for the rendered Markdown
+        # body. Used by the A9 startup self-update dialog. Never raises;
+        # any HTTP/JSON failure must come back as "" so startup keeps moving.
+        if not version:
+            return ""
+        url = f"https://api.github.com/repos/Midrags/SFF/releases/tags/{version}"
+        try:
+            resp = asyncio.run(
+                get_request(url, "json", headers=Updater._HEADERS)
+            )
+        except Exception:
+            return ""
+        if not isinstance(resp, dict):
+            return ""
+        body = resp.get("body")
+        return body if isinstance(body, str) else ""
+
+
+# Module-level convenience for the A9 startup hook.
+def fetch_release_notes(version):
+    return Updater.fetch_release_notes(version)

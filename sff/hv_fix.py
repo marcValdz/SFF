@@ -297,7 +297,28 @@ def _extract_to_game_folder(archive_path: Path, game_folder: Path, game_name: st
 
 
 def apply_hv_fix(game_name: str, game_folder: Path, build_id: str | None = None) -> bool:
-    """Full HV fix flow: fetch game list, let user pick, download, extract, copy VBS.cmd."""
+    """Full HV fix flow: fetch game list, let user pick, download, extract, copy VBS.cmd.
+
+    Temporarily disabled in 6.2.4 because buzzheavier (the host HVAuto
+    points at) started serving aggressive malware-laden ad pop-ups and
+    fake download buttons. Re-enable once HVAuto switches to a safer
+    host (pixeldrain etc).
+    """
+    print(Fore.YELLOW
+          + "HV Auto is temporarily disabled.\n"
+          + "  HVAuto's downloads are hosted on buzzheavier, which is "
+          + "currently serving malware ads and fake download buttons. "
+          + "We've blocked the integration in SteaMidra until the "
+          + "fixes move to a safer host (pixeldrain, mediafire, or "
+          + "similar). Sorry for the inconvenience."
+          + Style.RESET_ALL)
+    return False
+
+
+def _apply_hv_fix_real(game_name: str, game_folder: Path, build_id: str | None = None) -> bool:
+    """Original HV fix implementation. Kept around so we can re-enable it
+    once HVAuto moves off buzzheavier — flip apply_hv_fix to delegate
+    here again."""
     all_games = fetch_hv_games()
     if not all_games:
         return False

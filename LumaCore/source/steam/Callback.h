@@ -1,3 +1,8 @@
+// LumaCore — Steam client hook layer for SteaMidra.
+// Copyright (c) 2025-2026 Midrag (https://github.com/Midrags).
+// Distributed under the GNU General Public License v3 or later.
+// See <https://www.gnu.org/licenses/> for the full license text.
+
 #pragma once
 
 // ── ISteamUser callbacks (base = 100) ───────────────────────────────
@@ -32,3 +37,34 @@ struct AppLicensesChanged_t
 };
 static_assert(sizeof(AppLicensesChanged_t) == 0x118,
               "AppLicensesChanged_t must be 0x118 bytes");
+
+//-----------------------------------------------------------------------------
+// Purpose: Fires when an achievement is committed to Steam's servers.
+//          Steam re-emits this for cached unlocks at login, which is how
+//          stale unlocks from a prior account/install bleed back into the
+//          overlay after switching users. SendCallbackToPipe drops the
+//          callback for configured appids before it reaches the UI.
+//
+//          Layout: starts with a CGameID (low 24 bits = AppId), so we can
+//          read the appid by reinterpreting the first 8 bytes of the
+//          callback payload.
+//-----------------------------------------------------------------------------
+struct UserAchievementStored_t
+{
+	static constexpr int k_iCallback = 1103;
+};
+
+//-----------------------------------------------------------------------------
+// Purpose: Schema delivery for an appid (callback id 1102). Steam re-emits
+//          cached schemas at login, which is how stale unlocks for an appid
+//          bind back into the overlay even after the values cache (callback
+//          1103) is wiped. A16 drops 1102 for configured appids alongside
+//          the existing 1103 drop.
+//
+//          Layout: starts with a CGameID, so the appid extraction matches
+//          1103 (low 24 bits of the first 8 bytes of the payload).
+//-----------------------------------------------------------------------------
+struct UserStatsReceived_t
+{
+	static constexpr int k_iCallback = 1102;
+};
