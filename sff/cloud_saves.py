@@ -17,10 +17,11 @@
 # along with SteaMidra.  If not, see <https://www.gnu.org/licenses/>.
 
 """
-Cloud saves — local backup and restore for game save files.
+Cloud saves. Local backup + restore for game save files.
 
-Scans common save locations, backs up to %APPDATA%/SteaMidra/save_backups/,
-and provides timestamped restore points.
+Scans the usual save spots (Documents, AppData, Steam userdata, etc),
+copies them to %APPDATA%/SteaMidra/save_backups/, and tags each backup
+with a timestamp so users can roll back to a specific point.
 """
 
 import os
@@ -95,7 +96,7 @@ SAVE_FOLDER_HINTS = [
 
 @dataclass
 class SaveInfo:
-    """information about a detected save location"""
+    """one detected save folder for a game"""
     app_id: int
     game_name: str
     save_path: str
@@ -106,7 +107,7 @@ class SaveInfo:
 
 @dataclass
 class BackupInfo:
-    """information about a save backup"""
+    """one snapshot we took, used by the restore UI"""
     app_id: int
     game_name: str
     backup_path: str
@@ -123,7 +124,31 @@ class BackupInfo:
 
 
 def _get_backup_dir():
-    """get the save backup root directory"""
+    """root folder where every appid's snapshots live.
+
+    Honours the user-selected `cloud_local_backup_dest` setting from the
+    Cloud Saves UI when it points at an existing or creatable folder.
+    Falls back to %APPDATA%/SteaMidra/save_backups/ otherwise. The user
+    sets this through the Local-provider folder picker on the Cloud Saves
+    tab, and the setting persists across sessions.
+    """
+    custom = ""
+    try:
+        from sff.storage.settings import get_setting, Settings
+        custom = (get_setting(Settings.CLOUD_LOCAL_BACKUP_DEST) or "").strip()
+    except Exception:
+        # Settings not loadable yet (early bootstrap) — fall through to default.
+        custom = ""
+    if custom:
+        try:
+            p = Path(custom)
+            p.mkdir(parents=True, exist_ok=True)
+            return p
+        except OSError:
+            # Custom path is unwritable (no permission, drive missing).
+            # Drop back to APPDATA so the legacy code paths keep working
+            # instead of crashing on every backup attempt.
+            pass
     base = Path(os.environ.get("APPDATA", os.path.expanduser("~")))
     backup_dir = base / "SteaMidra" / "save_backups"
     backup_dir.mkdir(parents=True, exist_ok=True)
@@ -132,20 +157,16 @@ def _get_backup_dir():
 
 class CloudSaves:
     """
-    Local save backup and restore system.
+    Local save backup + restore.
 
-    Backs up game saves to %APPDATA%/SteaMidra/save_backups/{appid}/
-    with timestamped snapshots.
+    Snapshots land under %APPDATA%/SteaMidra/save_backups/{appid}/,
+    each timestamped so the user can pick which one to restore.
 
-    Structure:
-        save_backups/
-        ├── {appid}/
-        │   ├── manifest.json
-        │   ├── backup_20260413_120000/
-        │   │   └── (save files)
-        │   └── backup_20260413_130000/
-        │       └── (save files)
-        └── ...
+    save_backups/
+      {appid}/
+        manifest.json
+        backup_20260413_120000/
+        backup_20260413_130000/
     """
 
     def __init__(self):
@@ -153,8 +174,9 @@ class CloudSaves:
 
     def detect_saves(self, app_id, game_name = ""):
         """
-        Try to detect save files for a game.
-        Searches common locations for folders matching the app ID or game name.
+        Try to find where a game's saves live.
+        Looks through the usual spots for folders that match the appid
+        or the game name.
         """
         results = []
         search_terms = [str(app_id)]
@@ -185,7 +207,7 @@ class CloudSaves:
         return results
 
     def _scan_save_dir(self, path, app_id, game_name):
-        """scan a directory for save files"""
+        """walk a folder, count files + size, return None if it's empty"""
         try:
             file_count = 0
             total_size = 0
@@ -612,10 +634,12 @@ def _resolve_game_name(folder_name, name_map_cache=None):
             except Exception:
                 pass
         game_name = name or f"App {app_id}"
-        label = f"{app_id} - {game_name}"
+        sanitized_game_name = "".join(c if c not in r'\/:*?"<>|' else "_" for c in game_name)
+        label = f"{app_id} - {sanitized_game_name}"
         return app_id, game_name, label
     else:
-        return None, folder_name, folder_name
+        sanitized_folder_name = "".join(c if c not in r'\/:*?"<>|' else "_" for c in folder_name)
+        return None, folder_name, sanitized_folder_name
 
 
 def scan_all_save_locations(steam_path=None, steam32_id=None):
@@ -754,7 +778,8 @@ def scan_all_save_locations(steam_path=None, steam32_id=None):
                                 break
             except Exception:
                 pass
-            label = f"{app_id_int} - {game_name}" if app_id_int else game_name
+            safe_game_name = "".join(c if c not in r'\/:*?"<>|' else "_" for c in game_name)
+            label = f"{app_id_int} - {safe_game_name}" if app_id_int else safe_game_name
             results.append({
                 "location": "Custom Path",
                 "folder_name": src.name,

@@ -3,13 +3,17 @@
 *Made by Midrag and his brother!*
 ## Educational use only. Use at your own risk.
 
-> ⚠️ **Antivirus Warning:** Before doing anything, add the entire **SteaMidra folder** (especially `sff\dlc_unlockers\resources`) to Windows Defender exclusions — the DLC unlocker tools inside trigger false positives.
+> ⚠️ **Antivirus Warning:** some AVs flag the binary as a generic packed-exe false positive. it's not malware. if your AV keeps quarantining it, add the SteaMidra folder to your AV exclusion list. the source is open at github.com/Midrags/SFF if you want to verify.
 >
 > To add exclusions: **Windows Security → Virus & threat protection → Manage settings → Exclusions → Add or remove exclusions → Add a folder**.
 
 SteaMidra helps you set up games to work with Steam using Lua scripts, manifests, and LumaCore. It writes the right files into your Steam folder so games and DLC can run. It does not replace or crack Steam itself.
 
 Need help? Chat with us on our Discord server: https://discord.gg/V8aZqnbB84
+
+**SteaMidra setup tutorial:** [Full walkthrough by @yensnc](https://youtu.be/PQ1FqK8NJ44)
+
+**API key tutorial:** [Step-by-step screenshots by @novoagain](https://imgur.com/a/ubLeqer)
 
 **Old SteaMidra setup tutorial (outdated):** ["Outdated" tutorial for new users](https://youtu.be/9aAaQ8dSnTY)
 
@@ -25,12 +29,12 @@ Need help? Chat with us on our Discord server: https://discord.gg/V8aZqnbB84
 - **Multiplayer Fix** — downloads and applies multiplayer patches from **online-fix.me** straight into the game folder. Requires an online-fix.me account.
 - **Fixes & Bypasses** — searches a curated list from the CrakFiles repo on GitHub and applies the chosen fix to the game folder. No API key, no account. Achievement-safe — only adds bypass DLLs, leaves the Steam API intact.
 - **HyperVisor Cracks (HV Auto)** — download HyperVisor bypasses for Denuvo-protected games. Includes VBS.cmd to prepare your system. See the [HyperVisor Guide](docs/HV_GUIDE.md) before use.
-- DLC status check, cracking (gbe_fork), SteamStub DRM removal (Steamless), and DLC Unlockers (CreamInstaller-style: SmokeAPI, CreamAPI, Koaloader, Uplay).
+- DLC status check, cracking (gbe_fork), SteamStub DRM removal (Steamless), and DLC Unlockers (CreamInstaller-style: SmokeAPI, CreamAPI, Uplay).
 - **Multi-language GUI** — English and Portuguese built-in; add more via `sff/locales/`.
 - Parallel downloads, backups, recent files, and settings export/import.
 - **Linux support** — SLSSteam ID management, platform-aware MIDI, and Linux-compatible auto-update.
-- **Store tab** — browse Hubcap's manifest library to find games and download either using the Steam download function for downloading latest versions very quick or **older or specific versions** of a game via DepotDownloaderMod (.NET 9 required, slower). Use this **only** when you need a specific older version of a game, not the latest.
-- **Main tab "Download Game"** — ⭐ **THIS IS THE MAIN WAY TO DOWNLOAD GAMES.** Downloads the **latest version** of a game directly from Steam (fast, no .NET required for Windows OS). Processes the Lua file, writes decryption keys, copies the Lua to `config/stplug-in/` and the manifests to `depotcache/` so LumaCore picks the game up immediately, then triggers Steam to download the game files natively. Use this for 99% of games.
+- **Store tab** — ⭐ **THIS IS THE MAIN WAY TO DOWNLOAD GAMES.** browse Hubcap's manifest library to find games and download either using the Steam download function for downloading latest versions very quick or **older or specific versions** of a game via DepotDownloaderMod (.NET 9 required, slower). Use this **only** when you need a specific older version of a game, not the latest.
+- **Main tab "Download Game"** — Downloads the **latest version** of a game directly from Steam (fast, no .NET required for Windows OS). Processes the Lua file, writes decryption keys, copies the Lua to `config/stplug-in/` and the manifests to `depotcache/` so LumaCore picks the game up immediately, then triggers Steam to download the game files natively. Use this for 99% of games.
 
 ---
 
@@ -38,8 +42,9 @@ Need help? Chat with us on our Discord server: https://discord.gg/V8aZqnbB84
 
 ### Step 1: SteaMidra
 
-Download the latest version from [here](https://github.com/Midrags/SFF/releases/latest).
-You will get a ZIP file (`SteaMidra-x.x.x-windows.zip`). Extract it anywhere — you will see a folder containing `SteaMidra_GUI.exe` and an `_internal/` folder. Place this folder wherever you want (e.g. `C:\SteaMidra\`).
+Download the latest installer from [here](https://github.com/Midrags/SFF/releases/latest) and run it. The installer auto-creates the install folder, sets up file associations, and registers the uninstaller.
+
+If the installer fails or your AV blocks it, grab the ZIP instead — `SteaMidra-x.x.x-windows.zip`. Extract anywhere, run `SteaMidra_GUI.exe` from inside the extracted folder.
 
 **Do not run SteaMidra yet.** Complete Steps 2 and 3 first so all folders exist before first launch.
 
@@ -173,6 +178,8 @@ See [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) for common problems and s
 **Hubcap Manifest** – Store browser and manifest library API provided by **Hubcap Manifest** ([hubcapmanifest.com](https://hubcapmanifest.com)). Formerly known as Morrenus / Solus.
 
 **RedPaper** – Credit to RedPaper for the Broken Moon MIDI cover, originally arranged by U2 Akiyama and used in Touhou 7.5: Immaterial and Missing Power. Touhou 7.5 and its assets are owned by Team Shanghai Alice and Twilight Frontier. SteaMidra is not affiliated with or endorsed by either party. All trademarks belong to their respective owners.
+
+**Tutorials** – Setup walkthrough by **@yensnc** (https://youtu.be/PQ1FqK8NJ44). API key tutorial by **@novoagain** (https://imgur.com/a/ubLeqer).
 
 README rewrite assisted by **itsphox**.
 

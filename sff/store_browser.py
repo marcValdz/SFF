@@ -190,6 +190,19 @@ class StoreApiClient:
             params["search"] = search
         try:
             resp = self._get_client().get("/library", params=params)
+            # Hubcap library returns 500 on a bunch of cyrillic queries (RU
+            # users hit this constantly typing "рф" in the search field) and
+            # sometimes 503 during their own outages. Both are server-side,
+            # nothing the client can do, and surfacing them as ERROR popups
+            # in the live log scared people. Treat 4xx/5xx the same as an
+            # empty result so the rest of the pipeline (Steam applist etc)
+            # picks up the slack quietly.
+            if resp.status_code in (400, 500, 503):
+                logger.debug(
+                    "hubcap library api %s for offset=%d limit=%d search=%r, skipping",
+                    resp.status_code, offset, limit, search,
+                )
+                return LibraryPage(offset=offset, limit=limit)
             resp.raise_for_status()
             data = resp.json()
             games = []
@@ -212,6 +225,12 @@ class StoreApiClient:
                 offset=offset,
                 limit=limit,
             )
+        except httpx.HTTPStatusError as e:
+            # raise_for_status above re-raises 4xx/5xx that aren't in the
+            # quiet-skip set. Still keep them out of ERROR-level so the live
+            # log doesn't get spammed.
+            logger.debug("hubcap library status err %s: %s", e.response.status_code, e)
+            return LibraryPage(offset=offset, limit=limit)
         except Exception as e:
             logger.error("Failed to get library: %s", e)
             return LibraryPage()
@@ -230,6 +249,16 @@ class StoreApiClient:
             params["appid"] = "true"
         try:
             resp = self._get_client().get("/search", params=params)
+            # Hubcap /search rejects a lot of cyrillic queries with 400 and
+            # has a known 500 cluster too. Both are server-side. Return an
+            # empty list with a single DEBUG line so the user just sees "no
+            # results" instead of a scary [ERRO] popup.
+            if resp.status_code in (400, 500, 503):
+                logger.debug(
+                    "hubcap search api %s for q=%r, skipping",
+                    resp.status_code, query,
+                )
+                return []
             resp.raise_for_status()
             data = resp.json()
             results = []
@@ -247,6 +276,9 @@ class StoreApiClient:
                     platforms=_parse_platforms(item),
                 ))
             return results
+        except httpx.HTTPStatusError as e:
+            logger.debug("hubcap search status err %s: %s", e.response.status_code, e)
+            return []
         except Exception as e:
             logger.error("Search failed: %s", e)
             return []
@@ -348,3 +380,56 @@ class StoreApiClient:
         except Exception as e:
             logger.error("Failed to get user stats: %s", e)
             return None
+
+
+# Module-level Store grid cache. The Web bridge wipes this on
+# `store_show_software` toggles so the next list_games call
+# rebuilds against the fresh setting. Stays None until a caller
+# decides to use it; list_games itself does not populate it.
+_cached_grid = None
+
+
+def _coerce_show_software(raw) -> bool:
+    """STORE_SHOW_SOFTWARE ships as a bool but older settings.bin
+    blobs may surface it as a string. Match the close-to-tray pattern
+    so the parse is consistent across the project."""
+    if raw is None or raw == "":
+        return False
+    if isinstance(raw, bool):
+        return raw
+    return str(raw).strip().lower() not in ("false", "0", "no", "off")
+
+
+def list_games(entries):
+    """Filter a Store grid result set against `STORE_SHOW_SOFTWARE`.
+
+    The setting is read on every call, so a flip from the Settings
+    dialog takes effect on the next round trip without restart. When
+    the toggle parses as false, every entry whose `type` field equals
+    `"software"` is dropped before the list returns. Entries whose
+    type is unset, missing, or non-string pass through untouched.
+
+    The input is iterable of dicts (Steam IStoreService rows or the
+    Hubcap-merged dicts the Store tab renders). The output preserves
+    input order and is a fresh list, so the caller can mutate freely.
+    """
+    try:
+        from sff.storage.settings import get_setting as _get
+        from sff.structs import Settings
+        show_software = _coerce_show_software(_get(Settings.STORE_SHOW_SOFTWARE))
+    except Exception:
+        # Settings layer unreachable: keep the conservative default
+        # (hide software, matching the SettingItem default of False).
+        show_software = False
+
+    out = []
+    for entry in entries or []:
+        if not show_software:
+            try:
+                etype = entry.get("type") if isinstance(entry, dict) else getattr(entry, "type", None)
+            except Exception:
+                etype = None
+            if isinstance(etype, str) and etype.strip().lower() == "software":
+                continue
+        out.append(entry)
+    return out

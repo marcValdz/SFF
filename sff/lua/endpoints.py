@@ -77,8 +77,24 @@ def get_oureverday(dest, app_id):
     # Step 1: Steam native query for depot IDs
     print(Fore.CYAN + f"[Step 1] Fetching depot list for {app_id} from Steam client..." + Style.RESET_ALL)
     try:
-        provider = create_provider_for_current_thread()
-        app_info = provider.get_single_app_info(int(app_id))
+        # Build the SteamClient INSIDE the executor task. SteamClient binds
+        # gevent's hub to whichever OS thread constructed it, so if we make
+        # the client out here and then submit() get_single_app_info, the
+        # executor thread has no hub for that client and gevent fires
+        # "This operation would block forever". Building it inside keeps
+        # the client + the hub on the same thread.
+        from concurrent.futures import ThreadPoolExecutor, TimeoutError as _FT
+        def _fetch_app_info():
+            from sff.steam_client import create_provider_for_current_thread as _mk
+            _provider = _mk()
+            return _provider.get_single_app_info(int(app_id))
+        with ThreadPoolExecutor(max_workers=1) as _ex:
+            _fut = _ex.submit(_fetch_app_info)
+            try:
+                app_info = _fut.result(timeout=30)
+            except _FT:
+                print(Fore.RED + f"Steam app-info timed out for {app_id} (CM probably down)." + Style.RESET_ALL)
+                return None
         if not app_info:
             print(Fore.RED + f"Failed to query Steam App Info for {app_id}." + Style.RESET_ALL)
             return None

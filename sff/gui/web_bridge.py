@@ -25,6 +25,8 @@ Only trivial getters use synchronous result= slots.
 
 import json
 import logging
+import os
+import re
 import shutil
 import ssl as _ssl
 import sys
@@ -99,6 +101,7 @@ class WebBridge(QObject):
     depot_history_results = pyqtSignal(str)
     download_progress = pyqtSignal(str)
     task_finished = pyqtSignal(str)
+    task_progress = pyqtSignal(str)
     log_message = pyqtSignal(str)
     lc_progress = pyqtSignal(str)
 
@@ -110,6 +113,11 @@ class WebBridge(QObject):
         self._api_key = None
         self._store_client = None
         self._workers = []  # prevent GC of running workers
+        # 6.2.5: per-app update-available state cache. Populated by
+        # check_game_update() on success. The badge/popover code
+        # reads through get_game_update_state(). Keys are str(app_id).
+        # Network/CM failures leave the prior entry intact.
+        self._update_state_cache: dict[str, dict] = {}
 
     # ── helpers ──────────────────────────────────────────────────
 
@@ -203,7 +211,7 @@ class WebBridge(QObject):
         """
         def _do():
             # Steam catalog is always the primary source.
-            result = _search_steam_catalog(query, offset, per_page)
+            result = _search_steam_catalog(query, offset, per_page, sort_by=sort_by or 'updated')
             result.pop('fallback', None)
 
             client = self._get_store_client()
@@ -256,38 +264,107 @@ class WebBridge(QObject):
                 )
                 return result
 
-            # Drop Hubcap entries that Steam's appdetails reports as
-            # macOS-only or Linux-only (e.g. appid 12250 GTA: San Andreas
-            # Mac port). Hubcap's own response doesn't carry platform
-            # info, so we look it up via Steam's `appdetails?filters=basic`
-            # endpoint and cache the result for the lifetime of the
-            # process. Entries Steam can't resolve (delisted, no data)
-            # are kept so genuine classics aren't dropped.
+            # Structural DLC + platform filter for Hubcap-only candidates.
+            # Three drop signals, all derived from Steam's GetItems:
+            #
+            #   1. parent_appid is set  -> Steam tags this as DLC of
+            #      another app. Drops Cyberpunk Phantom Liberty,
+            #      RE6 Predator/Onslaught modes, RE Op Raccoon Echo
+            #      Six Expansion 1, Elden Ring Shadow of the Erdtree,
+            #      etc.
+            #   2. delisted_blank is True  -> GetItems returned no
+            #      name and no type. Steam strips public metadata
+            #      from removed DLC content (RE6 Mercenaries No
+            #      Mercy, RE5 Stories Bundle, RE4 weapon tickets).
+            #      Real classic delisted GAMES still return
+            #      name + type=0 (verified for GTA SA classic, Dark
+            #      Souls PTDE, Resident Evil HD), so this signal is
+            #      reliably DLC content.
+            #   3. platforms set excludes "windows"  -> macOS-only or
+            #      Linux-only port (e.g. appid 12250 GTA SA Mac).
+            #
+            # No name keywords. Steam-confirmed appids that already
+            # appear in the Steam catalog result skip the filter
+            # entirely so we trust Steam's own listing.
             steam_ids = {g.get('app_id') for g in result.get('games', []) or []}
             extra_ids = [aid for aid in hubcap_hits.keys() if aid not in steam_ids]
-            plat_map = _fetch_steam_platforms(extra_ids)
+            meta_map = _fetch_steam_platforms(extra_ids)
             non_windows_filtered = 0
+            dlc_filtered = 0
             kept_hubcap = {}
             for app_id, hg in hubcap_hits.items():
                 if app_id in steam_ids:
-                    # Steam already vouched for this appid; trust it.
                     kept_hubcap[app_id] = hg
                     continue
-                tags = plat_map.get(app_id, {"_unknown"})
-                if "_unknown" in tags or "windows" in tags:
-                    kept_hubcap[app_id] = hg
-                else:
+                meta = meta_map.get(app_id) or {}
+                tags = meta.get("platforms") or {"_unknown"}
+                parent_appid = meta.get("parent_appid")
+                delisted_blank = bool(meta.get("delisted_blank"))
+                store_type = (meta.get("type") or "").lower()
+
+                # search filter logs are gated behind SFF_VERBOSE_FILTER=1.
+                # default off because the live debug.log was getting
+                # thousands of identical "filtered Hubcap appid=..." lines
+                # per tab switch and burying real errors.
+                import os as _os_filt
+                _verbose_filter = _os_filt.environ.get("SFF_VERBOSE_FILTER") == "1"
+
+                # Structural DLC signals.
+                if parent_appid:
+                    # Re-releases (Enhanced / Definitive / GOTY /
+                    # Director's Cut) hang off the base appid the same
+                    # way DLC does, but ship as standalone games.
+                    # Steam tags them with `type: 14` (rerelease).
+                    # Keep those; drop everything else with a parent.
+                    if store_type == "rerelease":
+                        kept_hubcap[app_id] = hg
+                        continue
+                    dlc_filtered += 1
+                    if _verbose_filter:
+                        logger.debug(
+                            "search_games: filtered Hubcap appid=%s name=%r parent=%s",
+                            app_id, hg.name, parent_appid,
+                        )
+                    continue
+                if delisted_blank:
+                    dlc_filtered += 1
+                    if _verbose_filter:
+                        logger.debug(
+                            "search_games: filtered Hubcap appid=%s name=%r (delisted, no Steam metadata)",
+                            app_id, hg.name,
+                        )
+                    continue
+                # Belt-and-suspenders type drop. parent_appid covers
+                # type=2/4 already. This catches edge cases where
+                # GetItems returns type=5/7/9-15 (advertising, tool,
+                # video, music) without a parent appid. Re-releases
+                # (`type: 14` with parent set) are handled above.
+                if store_type and store_type not in ("game", "demo", "mod", "rerelease"):
+                    dlc_filtered += 1
+                    if _verbose_filter:
+                        logger.debug(
+                            "search_games: filtered Hubcap appid=%s name=%r type=%s",
+                            app_id, hg.name, store_type,
+                        )
+                    continue
+
+                # Platform check.
+                if "_unknown" not in tags and "windows" not in tags:
                     non_windows_filtered += 1
-                    logger.debug(
-                        "search_games: filtered Hubcap appid=%s name=%r platforms=%s (no windows)",
-                        app_id, hg.name, sorted(tags),
-                    )
+                    if _verbose_filter:
+                        logger.debug(
+                            "search_games: filtered Hubcap appid=%s name=%r platforms=%s",
+                            app_id, hg.name, sorted(tags),
+                        )
+                    continue
+
+                kept_hubcap[app_id] = hg
             hubcap_hits = kept_hubcap
 
             logger.info(
-                "search_games: query=%r got %d Steam + %d Hubcap hit(s) across %d variant(s) (%d non-windows filtered)",
+                "search_games: query=%r got %d Steam + %d Hubcap hit(s) across %d variant(s) (%d DLC filtered, %d non-windows filtered)",
                 query, len(result.get('games', [])), len(hubcap_hits),
-                len(queries), non_windows_filtered,
+                len(queries), dlc_filtered, non_windows_filtered,
             )
 
             # Overlay Hubcap status on Steam rows that share an app_id.
@@ -302,7 +379,11 @@ class WebBridge(QObject):
                 if hg.size:
                     g['size'] = hg.size
 
-            # Append Hubcap-only entries to the result list.
+            # Build the Hubcap-only tail. The merged result behaves
+            # like one virtual list: [steam_total Steam rows] then
+            # [len(extras) Hubcap rows]. Pagination has to slice that
+            # combined list per page; otherwise every page repeats
+            # the full Hubcap tail (the bug we used to ship).
             seen_ids = {g.get('app_id') for g in result.get('games', []) or []}
             extras = []
             for app_id, hg in hubcap_hits.items():
@@ -318,15 +399,40 @@ class WebBridge(QObject):
                     'source': 'hubcap',
                 })
 
-            if not result.get('games'):
-                # Steam had nothing. Use Hubcap as the primary result
-                # set so the UI doesn't show an empty page.
-                result['games'] = extras
-                result['total'] = len(extras)
+            steam_total = int(result.get('total') or 0)
+            steam_rows = result.get('games') or []
+            extras_total = len(extras)
+
+            # Slice the Hubcap tail for this page window.
+            window_start = max(0, offset - steam_total)
+            window_end = max(0, (offset + per_page) - steam_total)
+            extras_slice = extras[window_start:window_end] if extras_total else []
+
+            # Fill missing artwork for the Hubcap rows we actually ship.
+            if extras_slice:
+                slice_ids = [e['app_id'] for e in extras_slice if e.get('app_id')]
+                try:
+                    img_urls, _types = _fetch_steam_image_urls(slice_ids)
+                except Exception as e:
+                    logger.debug("search_games: image fetch for Hubcap tail failed: %s", e)
+                    img_urls = {}
+                for e in extras_slice:
+                    if not e.get('image_url'):
+                        e['image_url'] = img_urls.get(e['app_id']) or ''
+
+            if not steam_rows and not extras_slice and extras_total == 0:
+                # Steam had nothing AND Hubcap had nothing. Nothing to do.
+                return result
+
+            if not steam_rows and extras_total:
+                # Steam had nothing but Hubcap did. Surface Hubcap as the
+                # primary set; pagination is now over the extras list.
+                result['games'] = extras_slice
+                result['total'] = extras_total
                 result['fallback_source'] = 'hubcap'
-            elif extras:
-                result['games'].extend(extras)
-                result['total'] = (result.get('total') or 0) + len(extras)
+            else:
+                result['games'] = steam_rows + extras_slice
+                result['total'] = steam_total + extras_total
 
             return result
 
@@ -469,6 +575,20 @@ class WebBridge(QObject):
                 request_update=request_update,
             )
             if not lua_path:
+                # Surface a clear failure to the UI so the bar doesnt sit at
+                # 10% forever. download_lua_direct returns None on timeout
+                # against the Steam CM (30s ceiling) or any other source
+                # error. The user can switch source and retry.
+                self.download_progress.emit(json.dumps({
+                    "task": "download_fastest",
+                    "app_id": app_id,
+                    "status": (
+                        "Lua download failed. Steam CM may be down or the "
+                        "selected source returned nothing. Try a different "
+                        "provider (Hubcap / oureveryday) and retry."
+                    ),
+                    "progress": 0,
+                }))
                 return False
 
             saved_lua = saved_lua_root
@@ -681,6 +801,216 @@ class WebBridge(QObject):
         }))
 
     @pyqtSlot(str, str)
+    def download_dlc_oureveryday(self, dlc_appid, parent_appid):
+        """Oureveryday DLC-only path: pull just the DLCs depot manifest +
+        decryption key without re-downloading the parent game.
+
+        Flow:
+          1. Resolve parent app info from Steam, pull every depot whose
+             `dlcappid` matches the DLC appid. That gives us the depot
+             list and per-depot public manifest GID.
+          2. For each depot, fetch the depot key from the bundled key
+             database (same one oureveryday uses for the full game flow).
+             Skip any depot whose key isn't on file.
+          3. Pull the manifest bytes through the existing cascade
+             (gmrc -> ManifestHub https mirrors -> GitHub mirror -> CDN)
+             and drop into <steam>/depotcache/.
+          4. APPEND `addappid(<depot>, 1, "<key>")` lines to the existing
+             <steam>/config/stplug-in/<parent>.lua. Never overwrite the
+             whole file, so existing depot keys + setManifestid pins the
+             user already has stay intact. If the parent lua doesnt exist
+             yet, create it with `addappid(<parent>)` plus the new lines.
+        """
+        if not dlc_appid or not dlc_appid.strip().isdigit():
+            self._emit_task_result("download_dlc", False, f"Invalid DLC App ID: '{dlc_appid}'")
+            return
+        if not parent_appid or not parent_appid.strip().isdigit():
+            self._emit_task_result("download_dlc", False, f"Invalid parent App ID: '{parent_appid}'")
+            return
+
+        def _do():
+            import json as _json
+            from pathlib import Path as _Path
+            try:
+                from sff.steam_client import create_provider_for_current_thread
+                from sff.manifest.downloader import ManifestDownloader
+            except Exception as e:
+                logger.exception("download_dlc_oureveryday: import failed: %s", e)
+                return (False, f"Internal error: {e}")
+
+            steam_path = self._steam_path
+            if not steam_path:
+                return (False, "Steam path not configured")
+
+            self.download_progress.emit(_json.dumps({
+                "app_id": dlc_appid, "status": "Resolving DLC depots", "progress": 10
+            }))
+
+            # Step 1: parent appinfo for depot mapping
+            # SteamClient binds gevents hub to whichever OS thread built it,
+            # so the get_single_app_info call MUST live on the same thread
+            # as the client. Building the provider on this thread but
+            # submit()ing the I/O onto an executor thread fires
+            # "would block forever". Spin a throwaway provider INSIDE the
+            # executor for the timed app-info hit, and keep the local
+            # `provider` (built on this thread) for the downstream
+            # ManifestDownloader / cdn calls below.
+            try:
+                provider = create_provider_for_current_thread()
+                from concurrent.futures import ThreadPoolExecutor, TimeoutError as _FT
+                def _fetch_parent_info():
+                    from sff.steam_client import create_provider_for_current_thread as _mk
+                    return _mk().get_single_app_info(int(parent_appid))
+                with ThreadPoolExecutor(max_workers=1) as _ex:
+                    _fut = _ex.submit(_fetch_parent_info)
+                    try:
+                        parent_info = _fut.result(timeout=30)
+                    except _FT:
+                        return (False, "Steam app-info timed out (CM down?)")
+            except Exception as e:
+                logger.warning("download_dlc_oureveryday: provider failed: %s", e)
+                return (False, f"Steam query failed: {e}")
+            if not parent_info:
+                return (False, f"Steam returned no info for parent app {parent_appid}")
+
+            depots = parent_info.get("depots") or {}
+            if not isinstance(depots, dict):
+                return (False, "Parent depot map is malformed")
+
+            dlc_depots = []
+            for depot_id, depot_data in depots.items():
+                if not depot_id.isdigit() or not isinstance(depot_data, dict):
+                    continue
+                if str(depot_data.get("dlcappid", "")) != str(dlc_appid):
+                    continue
+                manifests = depot_data.get("manifests") or {}
+                gid = ""
+                if isinstance(manifests, dict):
+                    pub = manifests.get("public") or {}
+                    if isinstance(pub, dict):
+                        gid = str(pub.get("gid") or "")
+                dlc_depots.append((depot_id, gid))
+
+            if not dlc_depots:
+                return (False, f"No depots tagged with dlcappid={dlc_appid} on the parent")
+
+            # Step 2: bundled depot keys
+            self.download_progress.emit(_json.dumps({
+                "app_id": dlc_appid, "status": "Loading depot keys", "progress": 25
+            }))
+            keys_dict = {}
+            try:
+                local_db = _Path(__file__).parent.parent / "lua" / "fallback_depotkeys.json"
+                if local_db.exists():
+                    keys_dict = _json.loads(local_db.read_text(encoding="utf-8"))
+            except Exception as e:
+                logger.debug("download_dlc_oureveryday: key db load failed: %s", e)
+
+            # Step 3: fetch manifests through the standard cascade
+            self.download_progress.emit(_json.dumps({
+                "app_id": dlc_appid, "status": "Downloading DLC manifests", "progress": 50
+            }))
+            downloader = ManifestDownloader(provider, _Path(steam_path))
+            cdn = None
+            try:
+                cdn = downloader.get_cdn_client()
+            except Exception as e:
+                logger.debug("download_dlc_oureveryday: cdn client failed: %s", e)
+
+            saved = 0
+            new_lines = []
+            for depot_id, gid in dlc_depots:
+                key = keys_dict.get(depot_id)
+                if not key:
+                    logger.debug("download_dlc_oureveryday: no bundled key for depot %s", depot_id)
+                    continue
+                if not gid:
+                    # No public manifest GID listed. Still add the key line
+                    # so LumaCore can decrypt anything Steam later resolves
+                    # for that depot.
+                    new_lines.append(f'addappid({depot_id}, 1, "{key}")')
+                    continue
+                try:
+                    raw = downloader.download_single_manifest(
+                        depot_id, gid, cdn_client=cdn, app_id=str(parent_appid),
+                    )
+                except Exception as e:
+                    logger.debug("download_dlc_oureveryday: depot %s fetch raised: %s", depot_id, e)
+                    raw = None
+                if raw:
+                    try:
+                        if downloader._write_manifest_to_depotcache(raw, depot_id, gid, decrypt=False, dec_key=key):
+                            saved += 1
+                    except Exception as e:
+                        logger.debug("download_dlc_oureveryday: write %s_%s failed: %s", depot_id, gid, e)
+                new_lines.append(f'addappid({depot_id}, 1, "{key}")')
+
+            # Always announce the DLC appid as owned even if no depots had
+            # keys — the appid alone is enough for LumaCore to mark the
+            # title.
+            new_lines.append(f"addappid({dlc_appid})")
+
+            # Step 4: merge into existing parent lua, preserving prior keys
+            self.download_progress.emit(_json.dumps({
+                "app_id": dlc_appid, "status": "Updating parent lua", "progress": 85
+            }))
+            stplug = _Path(steam_path) / "config" / "stplug-in"
+            stplug.mkdir(parents=True, exist_ok=True)
+            lua_path = stplug / f"{parent_appid}.lua"
+            existing_text = ""
+            if lua_path.exists():
+                try:
+                    existing_text = lua_path.read_text(encoding="utf-8", errors="replace")
+                except Exception as e:
+                    logger.warning("download_dlc_oureveryday: could not read existing lua: %s", e)
+                    existing_text = ""
+            if not existing_text:
+                # Fresh lua. Seed with parent appid line so LumaCore picks
+                # the title up.
+                existing_text = f"addappid({parent_appid})\n"
+
+            # Dedupe: skip lines that already appear verbatim in the file.
+            # Lua matching here is line-for-line, so this avoids double
+            # entries on repeat clicks.
+            existing_lines = set(l.strip() for l in existing_text.splitlines() if l.strip())
+            appended = 0
+            extra = []
+            for line in new_lines:
+                if line not in existing_lines:
+                    extra.append(line)
+                    existing_lines.add(line)
+                    appended += 1
+            if extra:
+                if not existing_text.endswith("\n"):
+                    existing_text += "\n"
+                existing_text += "\n".join(extra) + "\n"
+                try:
+                    lua_path.write_text(existing_text, encoding="utf-8")
+                except Exception as e:
+                    logger.exception("download_dlc_oureveryday: lua write failed: %s", e)
+                    return (False, f"Failed to write parent lua: {e}")
+
+            self.download_progress.emit(_json.dumps({
+                "app_id": dlc_appid, "status": "Complete", "progress": 100
+            }))
+            msg = (
+                f"DLC {dlc_appid} added to {parent_appid}.lua "
+                f"({saved} manifest(s) saved, {appended} key line(s) appended)"
+                if appended or saved
+                else f"DLC {dlc_appid} already present in {parent_appid}.lua"
+            )
+            return (True, msg)
+
+        def _on_done(result):
+            if isinstance(result, tuple):
+                ok, msg = result
+                self._emit_task_result("download_dlc", ok, msg, dlc_app_id=dlc_appid, parent_app_id=parent_appid)
+            else:
+                self._emit_task_result("download_dlc", False, "DLC download failed", dlc_app_id=dlc_appid, parent_app_id=parent_appid)
+
+        self._run_async(_do, on_done=_on_done)
+
+    @pyqtSlot(str, str)
     def download_game_version(self, app_id, manifest_override_json):
         """Download specific version via process_from_store().
         Emits download_progress + task_finished signals."""
@@ -723,6 +1053,339 @@ class WebBridge(QObject):
             )
 
         self._run_async(_do, on_done=_on_done)
+
+    @pyqtSlot(str)
+    def dlc_check_get_list(self, app_id):
+        """Fetch DLC list for the selected game and emit a structured
+        `task_finished` payload the Web UI can render in a modal.
+
+        Replaces the old run_game_action('dlc_check') flow that piped
+        Rich console tables into stdout that the Web UI never displayed.
+        Two paths:
+
+          * Steam-side (Web API via SteamInfoProvider): pulls
+            `extended.listofdlc` and per-DLC type / depot / manifest
+            metadata. Used when the SteamClient is logged in.
+          * Steam Store fallback: hits `appdetails` and reads `dlc`
+            for the appid list, then pulls per-DLC names from the same
+            Store endpoint. Used when the Steam Web client times out.
+
+        Result payload shape:
+          { task: 'dlc_check', success: bool, app_id: str, source: str,
+            dlcs: [{ id, name, in_applist, has_key, has_manifest, type }],
+            owned_count, total_count, message: str }
+        """
+        if not app_id or not str(app_id).strip().isdigit():
+            self._emit_task_result("dlc_check", False, "Invalid app ID",
+                                   app_id=str(app_id), dlcs=[])
+            return
+
+        def _do():
+            base_id = int(app_id)
+            local_ids: set = set()
+            try:
+                if self._ui:
+                    inj = getattr(self._ui, 'app_list_man', None) or getattr(self._ui, 'sls_man', None)
+                    if inj is not None:
+                        local_ids = set(inj.get_local_ids() or [])
+            except Exception as e:
+                logger.debug("dlc_check_get_list: get_local_ids failed: %s", e)
+
+            # Local-first check. Steam itself reads these on disk so we do
+            # the same and don't rely on hubcap/store reporting an install.
+            #   1. <steam>\config\stplug-in\<parent>.lua  -> addappid(N)
+            #   2. <library>\steamapps\appmanifest_<parent>.acf
+            #      -> InstalledDepots / MountedDepots block
+            # Anything that shows up in either of those is treated as
+            # already unlocked even when the Steam web check is blind to it.
+            from pathlib import Path as _Path
+            import re as _re
+            lua_ids: set = set()
+            try:
+                if self._steam_path:
+                    lua_path = _Path(self._steam_path) / "config" / "stplug-in" / f"{base_id}.lua"
+                    if lua_path.exists():
+                        txt = lua_path.read_text(encoding="utf-8", errors="replace")
+                        for m in _re.finditer(r"addappid\s*\(\s*(\d+)", txt):
+                            try:
+                                lua_ids.add(int(m.group(1)))
+                            except ValueError:
+                                pass
+            except Exception as e:
+                logger.debug("dlc_check_get_list: parent lua parse failed: %s", e)
+
+            acf_depots: set = set()
+            try:
+                from sff.storage.vdf import get_steam_libs as _gsl
+                libs = _gsl(self._steam_path) if self._steam_path else []
+                for lib in libs:
+                    acf = _Path(lib) / "steamapps" / f"appmanifest_{base_id}.acf"
+                    if not acf.exists():
+                        continue
+                    raw = acf.read_text(encoding="utf-8", errors="replace")
+                    # depot ids appear as "<id>" keys inside the
+                    # InstalledDepots / MountedDepots blocks. Cheap regex
+                    # is fine here; the file is small and the structure
+                    # is stable enough.
+                    block = _re.search(
+                        r'"(?:InstalledDepots|MountedDepots)"\s*\{([^}]*)\}',
+                        raw, _re.IGNORECASE | _re.DOTALL,
+                    )
+                    if block:
+                        for m in _re.finditer(r'"(\d+)"', block.group(1)):
+                            try:
+                                acf_depots.add(int(m.group(1)))
+                            except ValueError:
+                                pass
+                    break
+            except Exception as e:
+                logger.debug("dlc_check_get_list: acf scan failed: %s", e)
+
+            # Try Steam Web API first via the existing provider; fall back
+            # to the Store API when the API call fails or returns no data.
+            # The provider.get_single_app_info call goes through SteamKit
+            # which hangs forever on a flaky CM ('This operation would
+            # block forever' from gevent). 45s ceiling on a worker pool,
+            # bumped from 30 because users on slow CMs were timing out.
+            dlc_ids: list = []
+            base_name = ""
+            depot_id_set: set = set()
+            # dlc_appid -> set of depot ids (from base_info depots map)
+            dlc_depot_map: dict = {}
+            steam_api_ok = False
+            try:
+                if self._ui and getattr(self._ui, 'provider', None):
+                    from concurrent.futures import ThreadPoolExecutor, TimeoutError as _FT
+                    base_info = None
+                    # SteamClient pins gevents hub to the OS thread that
+                    # constructed it. self._ui.provider was built on the
+                    # GUI thread (or whichever thread first touched the
+                    # ui), so calling its methods from a ThreadPoolExecutor
+                    # worker fires "would block forever". Build a
+                    # throwaway provider inside the executor instead.
+                    def _fetch_base_info():
+                        from sff.steam_client import create_provider_for_current_thread as _mk
+                        return _mk().get_single_app_info(base_id)
+                    with ThreadPoolExecutor(max_workers=1) as _ex:
+                        _fut = _ex.submit(_fetch_base_info)
+                        try:
+                            base_info = _fut.result(timeout=45)
+                        except _FT:
+                            logger.debug("dlc_check_get_list: Steam app-info timed out, falling back to store")
+                            base_info = None
+                    if base_info:
+                        steam_api_ok = True
+                        base_name = str(
+                            base_info.get('common', {}).get('name', '') or ''
+                        )
+                        from sff.utils import enter_path
+                        raw = enter_path(base_info, 'extended', 'listofdlc')
+                        if isinstance(raw, str) and raw.strip():
+                            dlc_ids = [
+                                int(x) for x in raw.split(',') if x.strip().isdigit()
+                            ]
+                        depots = base_info.get('depots') or {}
+                        if isinstance(depots, dict):
+                            for k, v in depots.items():
+                                if not isinstance(v, dict):
+                                    continue
+                                dlc_appid = v.get('dlcappid')
+                                if dlc_appid:
+                                    try:
+                                        dlc_aid_int = int(dlc_appid)
+                                        depot_id_set.add(dlc_aid_int)
+                                        try:
+                                            depot_id_int = int(k)
+                                        except (TypeError, ValueError):
+                                            depot_id_int = None
+                                        if depot_id_int is not None:
+                                            dlc_depot_map.setdefault(dlc_aid_int, set()).add(depot_id_int)
+                                    except (TypeError, ValueError):
+                                        pass
+            except Exception as e:
+                logger.debug("dlc_check_get_list: Steam API path failed: %s", e)
+
+            # When the live Steam API blew up, try a cached extended.listofdlc
+            # from the on-disk app-info cache. That's enough to render the
+            # modal even when 'block forever' kills the live call.
+            if not dlc_ids:
+                try:
+                    cache_obj = getattr(self._ui, 'app_info_cache', None) if self._ui else None
+                    if cache_obj is not None:
+                        cached = None
+                        try:
+                            cached = cache_obj.get(base_id)
+                        except Exception:
+                            cached = None
+                        if cached:
+                            from sff.utils import enter_path
+                            raw = enter_path(cached, 'extended', 'listofdlc')
+                            if isinstance(raw, str) and raw.strip():
+                                dlc_ids = [int(x) for x in raw.split(',') if x.strip().isdigit()]
+                            if not base_name:
+                                base_name = str(cached.get('common', {}).get('name', '') or '')
+                            cdepots = cached.get('depots') or {}
+                            if isinstance(cdepots, dict):
+                                for k, v in cdepots.items():
+                                    if not isinstance(v, dict):
+                                        continue
+                                    da = v.get('dlcappid')
+                                    if da:
+                                        try:
+                                            dai = int(da)
+                                            depot_id_set.add(dai)
+                                            try:
+                                                kid = int(k)
+                                                dlc_depot_map.setdefault(dai, set()).add(kid)
+                                            except (TypeError, ValueError):
+                                                pass
+                                        except (TypeError, ValueError):
+                                            pass
+                except Exception as e:
+                    logger.debug("dlc_check_get_list: app-info cache fallback failed: %s", e)
+
+            # Fallback to Store API for the DLC id list when Steam API
+            # didn't return anything.
+            if not dlc_ids:
+                try:
+                    from sff.steam_store import get_dlc_list_from_store
+                    result = get_dlc_list_from_store(base_id)
+                    if result:
+                        base_name = result[0] or base_name
+                        dlc_ids = list(result[1] or [])
+                except Exception as e:
+                    logger.debug("dlc_check_get_list: Store API path failed: %s", e)
+
+            if not dlc_ids:
+                self._emit_task_result(
+                    "dlc_check", True,
+                    f"{base_name or 'App ' + str(base_id)} has no DLCs",
+                    app_id=str(base_id),
+                    base_name=base_name,
+                    dlcs=[],
+                    owned_count=0,
+                    total_count=0,
+                )
+                return
+
+            # Pull DLC names. Prefer Steam Store API for delisted DLCs
+            # since the Web API may not expose them to a non-owning user.
+            from sff.steam_store import get_dlc_names_from_store
+            try:
+                names_map = get_dlc_names_from_store(dlc_ids) or {}
+            except Exception as e:
+                logger.debug("dlc_check_get_list: name fetch failed: %s", e)
+                names_map = {}
+
+            # Decryption keys live in <steam>/config/config.vdf.
+            try:
+                from sff.lua.writer import ConfigVDFWriter
+                cfg = ConfigVDFWriter(self._steam_path) if self._steam_path else None
+                key_map = cfg.ids_in_config(dlc_ids) if cfg else {}
+            except Exception as e:
+                logger.debug("dlc_check_get_list: key map failed: %s", e)
+                key_map = {}
+
+            # depotcache scan: filenames look like '<depotid>_<gid>.manifest'.
+            # if any depot the dlc owns lands here, count it as on-disk. cheap,
+            # one stat per directory entry.
+            depotcache_ids: set = set()
+            try:
+                if self._steam_path:
+                    from pathlib import Path as _P2
+                    candidates = [
+                        _P2(self._steam_path) / "depotcache",
+                        _P2(self._steam_path) / "config" / "depotcache",
+                    ]
+                    for d in candidates:
+                        if not d.exists():
+                            continue
+                        for entry in d.iterdir():
+                            n = entry.name
+                            if not n.endswith(".manifest"):
+                                continue
+                            head = n.split("_", 1)[0]
+                            if head.isdigit():
+                                try:
+                                    depotcache_ids.add(int(head))
+                                except ValueError:
+                                    pass
+            except Exception as e:
+                logger.debug("dlc_check_get_list: depotcache scan failed: %s", e)
+
+            # Windows registry: HKCU\Software\Valve\Steam\Apps\<dlc>\Installed.
+            # Steam writes 1 here when the DLC counts as installed in its own
+            # bookkeeping. Linux / non-Windows: silently skip.
+            registry_installed: set = set()
+            try:
+                import sys as _sys
+                if _sys.platform == "win32":
+                    import winreg as _wr
+                    for did in dlc_ids:
+                        try:
+                            with _wr.OpenKey(
+                                _wr.HKEY_CURRENT_USER,
+                                rf"Software\\Valve\\Steam\\Apps\\{did}",
+                            ) as _k:
+                                val, _ = _wr.QueryValueEx(_k, "Installed")
+                                if int(val) == 1:
+                                    registry_installed.add(int(did))
+                        except FileNotFoundError:
+                            continue
+                        except Exception:
+                            continue
+            except Exception as e:
+                logger.debug("dlc_check_get_list: registry scan failed: %s", e)
+
+            dlcs_payload = []
+            owned = 0
+            for did in dlc_ids:
+                # Source-of-truth merge: SLSSteam local list, parent lua,
+                # ACF MountedDepots/InstalledDepots, config.vdf depot keys,
+                # depotcache manifests for this dlc's depots, and the win32
+                # HKCU\Steam\Apps\<id>\Installed=1 registry flag. Any one
+                # of those flags it as on-disk.
+                in_local = did in local_ids
+                in_lua = did in lua_ids
+                in_acf = did in acf_depots
+                in_keymap = bool(key_map.get(did, False))
+                in_reg = did in registry_installed
+                in_depotcache = False
+                if depotcache_ids:
+                    own_depots = dlc_depot_map.get(did) or set()
+                    if own_depots and (own_depots & depotcache_ids):
+                        in_depotcache = True
+                in_applist = (
+                    in_local or in_lua or in_acf or in_keymap
+                    or in_reg or in_depotcache
+                )
+                if in_applist:
+                    owned += 1
+                is_depot = did in depot_id_set
+                dlcs_payload.append({
+                    "id": str(did),
+                    "name": names_map.get(did, f"DLC {did}"),
+                    "in_applist": in_applist,
+                    "has_key": in_keymap,
+                    "type": "depot" if is_depot else "appid",
+                })
+
+            self._emit_task_result(
+                "dlc_check", True,
+                f"{owned}/{len(dlc_ids)} DLCs unlocked for "
+                f"{base_name or 'App ' + str(base_id)}",
+                app_id=str(base_id),
+                base_name=base_name,
+                dlcs=dlcs_payload,
+                owned_count=owned,
+                total_count=len(dlc_ids),
+            )
+
+        def _on_error(msg):
+            self._emit_task_result("dlc_check", False, str(msg),
+                                   app_id=str(app_id), dlcs=[])
+
+        self._run_async(_do, on_error=_on_error)
 
     @pyqtSlot(str, str)
     def run_game_action(self, app_id, action):
@@ -1364,6 +2027,142 @@ class WebBridge(QObject):
         self._run_async(_do, on_done=_on_done)
 
     @pyqtSlot(str)
+    def workshop_auto_import(self, app_id):
+        """Scan local subscribed-mod folders and enqueue every not-yet-downloaded
+        workshop item. Emits task_finished with task='workshop_auto_import'.
+
+        The downloader adapter wraps the existing 4-method `download_workshop_item`
+        cascade so each enqueue runs through SteamWebAPI -> GGNetwork -> SteamCMD
+        -> authenticated SteamCMD just like the manual single-item button.
+        """
+        def _do():
+            try:
+                if not self._steam_path:
+                    return {"success": False, "error": "Steam path not set"}
+                if not str(app_id).strip().isdigit():
+                    return {"success": False, "error": f"Invalid App ID: {app_id!r}"}
+                aid = int(app_id)
+
+                from sff.manifest.workshop_auto_import import (
+                    workshop_auto_import as _impl,
+                )
+                from sff.manifest.workshop_dl import (
+                    download_workshop_item as _dl,
+                )
+                from sff.storage.settings import get_setting
+                from sff.structs import Settings
+                from sff.utils import sff_data_dir
+
+                user = get_setting(Settings.STEAM_USER) or "anonymous"
+                pwd = get_setting(Settings.STEAM_PASS) or ""
+
+                class _Adapter:
+                    """Adapter around download_workshop_item so the auto-import
+                    module can call enqueue(app_id, workshop_id) without knowing
+                    the cascade or output dir layout."""
+                    def enqueue(self, a_id: int, wid: str) -> None:
+                        out_dir = sff_data_dir() / "downloaded_files" / "workshop" / wid
+                        out_dir.mkdir(parents=True, exist_ok=True)
+                        _dl(
+                            wid, str(a_id), out_dir,
+                            steam_username=user, steam_password=pwd,
+                            log=logger.info,
+                        )
+
+                return _impl(self._steam_path, aid, _Adapter(), logger.info)
+            except Exception as e:
+                logger.exception("workshop_auto_import slot failed for app_id=%s", app_id)
+                return {"success": False, "error": str(e)}
+
+        def _on_done(result):
+            result = result or {}
+            success = bool(result.get("success"))
+            added = result.get("added") or []
+            skipped = result.get("skipped") or []
+            found = result.get("found") or []
+            if success:
+                msg = (
+                    f"Imported {len(added)} new, skipped {len(skipped)} already local "
+                    f"({len(found)} found)"
+                )
+            else:
+                msg = result.get("error") or "Auto-import failed"
+            self._emit_task_result(
+                "workshop_auto_import",
+                success,
+                msg,
+                added=added,
+                skipped=skipped,
+                found=found,
+                error=result.get("error") or "",
+            )
+
+        self._run_async(_do, on_done=_on_done)
+
+    @pyqtSlot(str)
+    def workshop_bypass_download(self, params_json):
+        """Ownership-bypass workshop download.
+
+        ``params_json`` shape:
+            {"input": "<URL or paste-list or collection URL>",
+             "api_key": "<optional override>"}
+
+        Streams ``task_progress`` events per item and finishes with
+        ``task_finished`` carrying the aggregate counts. The bypass path
+        sends only the Web API key and the UGC CDN GET, never Steam session
+        cookies.
+        """
+        def _do():
+            try:
+                params = json.loads(params_json)
+                raw_input = str(params.get("input") or "").strip()
+                override_key = str(params.get("api_key") or "").strip()
+                from sff.manifest.workshop_dl import run_bypass_batch
+                from sff.storage.settings import get_setting
+                from sff.structs import Settings
+                from sff.strings import STEAM_WEB_API_KEY as _DEFAULT_KEY
+
+                api_key = override_key
+                if not api_key:
+                    saved = get_setting(Settings.STEAM_WEB_API_KEY)
+                    if isinstance(saved, str) and saved.strip():
+                        api_key = saved.strip()
+                if not api_key:
+                    api_key = _DEFAULT_KEY
+
+                out_dir = Path.cwd() / "downloaded_files" / "workshop"
+
+                def _emit_progress(payload):
+                    try:
+                        self.task_progress.emit(json.dumps(payload))
+                    except Exception:
+                        logger.debug("task_progress emit failed", exc_info=True)
+
+                summary = run_bypass_batch(
+                    raw_input,
+                    out_dir,
+                    api_key,
+                    on_progress=_emit_progress,
+                )
+                return summary
+            except Exception as e:
+                logger.exception("workshop_bypass_download failed: %s", e)
+                return {"success": False, "error": str(e)}
+
+        def _on_done(result):
+            result = result or {}
+            self._emit_task_result(
+                "workshop_bypass",
+                bool(result.get("success")),
+                "",
+                added=int(result.get("added") or 0),
+                failed=int(result.get("failed") or 0),
+                error=result.get("error") or "",
+            )
+
+        self._run_async(_do, on_done=_on_done)
+
+    @pyqtSlot(str)
     def check_game_update(self, app_id):
         """Compare installed ACF buildid against Steam CM public buildid.
         If Steam CM is newer: download updated manifests and patch the ACF.
@@ -1481,6 +2280,13 @@ class WebBridge(QObject):
                 msg = f"Updated to build {result.get('cm_buildid', '')}"
             elif result.get("error"):
                 msg = result["error"]
+            # 6.2.5: feed the per-app update-state cache that the badge UI
+            # reads through get_game_update_state(). On a network or Steam
+            # CM failure, leave the prior entry intact and log the error.
+            try:
+                self._record_update_state(str(app_id), result)
+            except Exception as cache_err:
+                logger.debug("update-state cache write failed: %s", cache_err)
             # Strip keys that collide with _emit_task_result's positional params,
             # otherwise we get TypeError: got multiple values for 'success'/'message'/'task'.
             extras = {
@@ -1490,6 +2296,172 @@ class WebBridge(QObject):
             self._emit_task_result("update_check", success, msg, **extras)
 
         self._run_async(_do, on_done=_on_done)
+
+    # ── 6.2.5: per-game and global update-available toggle ───────
+
+    def _record_update_state(self, app_id_str: str, result: dict) -> None:
+        """Write a check_game_update result into the in-memory cache.
+
+        Successful checks (up_to_date or updated) refresh installed and
+        CM build ids plus checked_at. A network / Steam CM failure
+        leaves the previous cache entry intact and logs at debug level.
+        Both code paths emit one INFO log line so debug.log records
+        every check outcome (R18.4, R18.5).
+        """
+        import time as _time
+        prev = self._update_state_cache.get(app_id_str, {})
+        if not result.get("found"):
+            logger.info(
+                "update-state: app_id=%s skipped, ACF not found", app_id_str,
+            )
+            return
+        err = result.get("error")
+        if err and not (result.get("up_to_date") or result.get("updated")):
+            logger.warning(
+                "update-state: app_id=%s left stale, error=%s", app_id_str, err,
+            )
+            return
+        installed = str(result.get("installed_buildid") or prev.get("installed_buildid") or "")
+        cm = str(result.get("cm_buildid") or prev.get("cm_buildid") or "")
+        up_to_date = bool(result.get("up_to_date"))
+        enabled = self._app_update_check_enabled(app_id_str)
+        self._update_state_cache[app_id_str] = {
+            "enabled": enabled,
+            "up_to_date": up_to_date,
+            "installed_buildid": installed,
+            "cm_buildid": cm,
+            "checked_at": int(_time.time()),
+        }
+        logger.info(
+            "update-state: app_id=%s up_to_date=%s installed=%s cm=%s",
+            app_id_str, up_to_date, installed, cm,
+        )
+
+    def _app_update_check_enabled(self, app_id_str: str) -> bool:
+        """Resolve the effective enabled flag for an app.
+
+        Per-app override wins when present. Otherwise the global gate
+        decides. Defaults: GLOBAL_UPDATE_CHECK off (matches the declared
+        SettingItem default in `Settings.GLOBAL_UPDATE_CHECK`), no
+        override. Users opt in from the global Settings panel or per
+        tile in the home page.
+        """
+        try:
+            from sff.storage.settings import get_setting
+            from sff.structs import Settings
+        except Exception:
+            return False
+        global_on = get_setting(Settings.GLOBAL_UPDATE_CHECK)
+        if global_on is None or global_on == "":
+            global_on = False
+        if isinstance(global_on, str):
+            global_on = global_on.lower() in ("true", "1", "yes", "on")
+        raw = get_setting(Settings.UPDATE_CHECK_OVERRIDES) or "{}"
+        try:
+            overrides = json.loads(raw) if isinstance(raw, str) else (raw or {})
+        except Exception:
+            overrides = {}
+        if app_id_str in overrides:
+            return bool(overrides[app_id_str])
+        return bool(global_on)
+
+    @pyqtSlot(str, bool, result=str)
+    def set_game_update_override(self, app_id, enabled):
+        """Toggle the per-game LetUpdate override.
+
+        On True: write `<steam>/config/stplug-in/<appid>/00_LetUpdate_override.lua`
+        and stamp Settings.GAME_UPDATE_OVERRIDE so the next session knows.
+        On False: remove the override file (and any legacy variants) and
+        clear the setting key.
+
+        Returns a JSON string `{"ok": bool, "enabled": bool, "msg": str}`.
+        """
+        try:
+            from sff.let_update_override import set_enabled as _set_lc
+            ok = _set_lc(self._steam_path, str(app_id), bool(enabled))
+            return json.dumps({
+                "ok": bool(ok),
+                "enabled": bool(enabled),
+                "msg": "" if ok else "Override write failed; check debug.log",
+            })
+        except Exception as e:
+            logger.exception("set_game_update_override failed: %s", e)
+            return json.dumps({"ok": False, "enabled": False, "msg": str(e)})
+
+    @pyqtSlot(str, result=bool)
+    def get_game_update_override(self, app_id):
+        """Return whether 00_LetUpdate_override.lua is active for this app."""
+        try:
+            from sff.let_update_override import is_enabled as _is_lc
+            return bool(_is_lc(str(app_id)))
+        except Exception:
+            return False
+
+    @pyqtSlot(str, bool)
+    def set_game_update_check(self, app_id, enabled):
+        """Persist the per-app update-check override.
+
+        Stores a JSON map under Settings.UPDATE_CHECK_OVERRIDES so the
+        periodic timer and the badge UI both observe the same gate.
+        """
+        try:
+            from sff.storage.settings import get_setting, set_setting
+            from sff.structs import Settings
+            raw = get_setting(Settings.UPDATE_CHECK_OVERRIDES) or "{}"
+            try:
+                overrides = json.loads(raw) if isinstance(raw, str) else (raw or {})
+            except Exception:
+                overrides = {}
+            if not isinstance(overrides, dict):
+                overrides = {}
+            overrides[str(app_id)] = bool(enabled)
+            set_setting(Settings.UPDATE_CHECK_OVERRIDES, json.dumps(overrides))
+            # Refresh the cached state's enabled flag in-place so the
+            # badge UI reflects the toggle without waiting for the next
+            # check_game_update tick.
+            entry = self._update_state_cache.get(str(app_id))
+            if entry is not None:
+                entry["enabled"] = bool(enabled)
+            logger.info(
+                "set_game_update_check: app_id=%s enabled=%s", app_id, enabled,
+            )
+        except Exception as e:
+            logger.exception("set_game_update_check failed: %s", e)
+
+    @pyqtSlot(str, result=str)
+    def get_game_update_state(self, app_id):
+        """Return the cached update state for an app as a JSON string.
+
+        Fields: enabled, up_to_date, installed_buildid, cm_buildid,
+        checked_at. Missing entries return a default with enabled
+        resolved against the global gate plus per-app override.
+        """
+        try:
+            key = str(app_id)
+            cached = self._update_state_cache.get(key)
+            if cached is None:
+                state = {
+                    "enabled": self._app_update_check_enabled(key),
+                    "up_to_date": None,
+                    "installed_buildid": None,
+                    "cm_buildid": None,
+                    "checked_at": 0,
+                }
+            else:
+                state = dict(cached)
+                state["enabled"] = self._app_update_check_enabled(key)
+            # per-tile state read fires for every game in the library on
+            # every refresh tick. silenced; debug.log was drowning.
+            return json.dumps(state)
+        except Exception as e:
+            logger.exception("get_game_update_state failed: %s", e)
+            return json.dumps({
+                "enabled": True,
+                "up_to_date": None,
+                "installed_buildid": None,
+                "cm_buildid": None,
+                "checked_at": 0,
+            })
 
     @pyqtSlot(str)
     def lure_fix_acf(self, app_id):
@@ -1749,15 +2721,121 @@ class WebBridge(QObject):
         self._run_async(_do, on_done=_on_done)
 
     @pyqtSlot(result=str)
-    def lumacore_check_update(self):
+    def steam_updates_get_state(self):
+        """Return 'blocked', 'unblocked', or 'unknown' based on the
+        BootStrapperInhibitAll line in <steam>/steam.cfg.
+
+        - blocked   : steam.cfg exists AND the line is set to Enable/true/1
+        - unblocked : steam.cfg exists AND the line is set to False/0/no
+        - unknown   : file missing OR no BootStrapperInhibitAll line found
+        """
+        try:
+            steam_path = self._steam_path
+            if not steam_path:
+                return "unknown"
+            cfg_path = steam_path / "steam.cfg"
+            if not cfg_path.is_file():
+                return "unknown"
+            text = cfg_path.read_text(encoding="utf-8", errors="replace")
+            for line in text.splitlines():
+                stripped = line.strip()
+                if not stripped or stripped.startswith("#"):
+                    continue
+                if "=" not in stripped:
+                    continue
+                key, _, val = stripped.partition("=")
+                if key.strip().lower() != "bootstrapperinhibitall":
+                    continue
+                normalised = val.strip().lower()
+                if normalised in ("enable", "enabled", "true", "1", "yes"):
+                    return "blocked"
+                if normalised in ("false", "0", "no", "disable", "disabled"):
+                    return "unblocked"
+                return "unknown"
+            return "unknown"
+        except Exception as exc:
+            logger.warning("steam_updates_get_state failed: %s", exc)
+            return "unknown"
+
+    @pyqtSlot(str, result=str)
+    def steam_updates_set_state(self, action):
+        """Write or update the BootStrapperInhibitAll line in
+        <steam>/steam.cfg based on `action`.
+
+        action = 'block'   sets BootStrapperInhibitAll=Enable
+        action = 'unblock' sets BootStrapperInhibitAll=False
+
+        Preserves any other lines already in steam.cfg. Creates the file
+        when it doesn't exist. Returns the new state ('blocked', 'unblocked')
+        on success, or an error message string on failure.
+        """
+        try:
+            steam_path = self._steam_path
+            if not steam_path:
+                return "Steam path not set"
+            cfg_path = steam_path / "steam.cfg"
+
+            normalised = (action or "").strip().lower()
+            if normalised == "block":
+                new_value = "Enable"
+                final_state = "blocked"
+            elif normalised == "unblock":
+                new_value = "False"
+                final_state = "unblocked"
+            else:
+                return f"unknown action: {action!r}"
+
+            existing_lines = []
+            if cfg_path.is_file():
+                existing_lines = cfg_path.read_text(
+                    encoding="utf-8", errors="replace"
+                ).splitlines()
+
+            replaced = False
+            new_lines = []
+            for line in existing_lines:
+                stripped = line.strip()
+                if "=" in stripped and not stripped.startswith("#"):
+                    key, _, _ = stripped.partition("=")
+                    if key.strip().lower() == "bootstrapperinhibitall":
+                        new_lines.append(f"BootStrapperInhibitAll={new_value}")
+                        replaced = True
+                        continue
+                new_lines.append(line)
+            if not replaced:
+                new_lines.append(f"BootStrapperInhibitAll={new_value}")
+
+            body = "\n".join(new_lines).rstrip() + "\n"
+            cfg_path.write_text(body, encoding="utf-8")
+            logger.info(
+                "steam_updates_set_state: %s -> %s (%s)",
+                final_state, cfg_path, new_value,
+            )
+            return final_state
+        except Exception as exc:
+            logger.warning("steam_updates_set_state failed: %s", exc)
+            return f"write failed: {exc}"
+
+    @pyqtSlot(str, result=str)
+    def lumacore_check_update(self, _arg=""):
         """Return JSON {installed, latest, update_available, source} for the
         Settings / Home update banner. Honours the 6-hour cooldown so the
         first call after launch hits GitHub and subsequent calls reuse the
         cached answer.
+
+        Accepts an unused string argument because the JS bridge calls this
+        through callWithCallback, which always sends the leading argument
+        before the callback. Slots without a parameter slot were silently
+        dropped, so the modal never repopulated.
+
+        When the argument is the literal string "force", the cooldown is
+        bypassed and a fresh probe hits GitHub. Used by the Check for
+        updates button so users get an answer they can trust.
         """
         try:
             from sff.lumacore_setup import check_for_lumacore_update
-            data = check_for_lumacore_update(self._steam_path)
+            force = (str(_arg).strip().lower() == "force")
+            data = check_for_lumacore_update(self._steam_path, force=force)
             return json.dumps(data)
         except Exception as exc:
             logger.warning("lumacore_check_update failed: %s", exc)
@@ -1976,6 +3054,14 @@ class WebBridge(QObject):
                         global _STEAM_APPLIST_CACHE, _STEAM_APPLIST_CACHE_TIME
                         _STEAM_APPLIST_CACHE = None
                         _STEAM_APPLIST_CACHE_TIME = 0.0
+                        # Defence-in-depth: drop the Store grid cache so
+                        # list_games rebuilds with the fresh toggle on
+                        # the next round trip.
+                        try:
+                            from sff import store_browser as _sb
+                            _sb._cached_grid = None
+                        except Exception:
+                            pass
                         from sff.utils import root_folder
                         _all_games = root_folder(outside_internal=True) / "all_games.txt"
                         if _all_games.exists():
@@ -2171,6 +3257,82 @@ class WebBridge(QObject):
         def _do():
             queue = self._get_bulk_import_queue()
             queue.enqueue_files(Path(p) for p in paths if p)
+            self._maybe_drain_queue(queue)
+            return queue.summary()
+
+        def _on_done(summary):
+            self._emit_bulk_summary("drop", summary)
+
+        self._run_async(_do, on_done=_on_done)
+
+    @pyqtSlot(str)
+    def enqueue_dropped_blobs(self, blobs_json):
+        """Accept a JSON list of dropped file payloads from the JS Drop
+        Zone, write each blob to a per-session temp folder, and enqueue
+        those temp paths through the standard bulk-import pipeline.
+
+        QtWebEngine's Chromium 124+ no longer exposes `file.path` on
+        drag-and-drop, so the JS side cannot read the user's actual
+        filesystem path. Instead it reads file CONTENT via
+        `file.arrayBuffer()`, base64-encodes it, and passes
+        ``[{name, content_b64}]`` here. We materialize each entry to
+        ``<sff_data>/.bulk_import_drop/<safe-name>`` and feed those
+        paths into BulkImportQueue. Validation, dedupe, and the rest
+        of the pipeline are unchanged from the folder-scan path.
+        """
+        try:
+            blobs = json.loads(blobs_json or "[]")
+        except Exception as exc:
+            logger.warning("enqueue_dropped_blobs: bad JSON: %s", exc)
+            return
+        if not isinstance(blobs, list) or not blobs:
+            return
+
+        def _do():
+            import base64 as _b64
+            import re as _re
+            from sff.utils import sff_data_dir
+
+            staging = sff_data_dir() / ".bulk_import_drop"
+            staging.mkdir(parents=True, exist_ok=True)
+            paths: list[Path] = []
+            unsafe_re = _re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+
+            for blob in blobs:
+                if not isinstance(blob, dict):
+                    continue
+                name = str(blob.get("name", "")).strip()
+                content_b64 = blob.get("content_b64", "")
+                if not name or not content_b64:
+                    continue
+                # Reject anything that doesn't end in .lua / .zip / .manifest;
+                # bulk_import already does this, but we save the I/O round trip.
+                lower = name.lower()
+                if not (lower.endswith(".lua") or lower.endswith(".zip") or lower.endswith(".manifest")):
+                    continue
+                safe = unsafe_re.sub("_", name)
+                target = staging / safe
+                # Avoid overwriting a sibling drop with the same name in the
+                # same session; suffix by appending a counter.
+                counter = 0
+                base_target = target
+                while target.exists():
+                    counter += 1
+                    target = base_target.with_name(f"{base_target.stem}__{counter}{base_target.suffix}")
+                try:
+                    raw = _b64.b64decode(content_b64, validate=False)
+                    target.write_bytes(raw)
+                except Exception as exc:
+                    logger.warning(
+                        "enqueue_dropped_blobs: write failed for %r: %s", name, exc
+                    )
+                    continue
+                paths.append(target)
+
+            if not paths:
+                return None
+            queue = self._get_bulk_import_queue()
+            queue.enqueue_files(iter(paths))
             self._maybe_drain_queue(queue)
             return queue.summary()
 
@@ -2561,6 +3723,22 @@ class WebBridge(QObject):
                 if not selected_depots:
                     return (False, "No depots with decryption keys found in Lua")
 
+                # If no manifests resolved for any selected depot, DDMod will
+                # fall back to anonymous CDN fetch and 401. Give the user a
+                # specific error instead of the generic "DepotDownloaderMod
+                # reported failure" line.
+                _depots_without_manifest = [
+                    d for d in selected_depots if str(d) not in manifests_dict
+                ]
+                if len(_depots_without_manifest) == len(selected_depots):
+                    return (
+                        False,
+                        "No manifest IDs available for any depot. "
+                        "Drop a folder of .manifest files into the modal, "
+                        "pick a manifest source (Hubcap/Ryuu/oureveryday), "
+                        "or run Update All Games first.",
+                    )
+
                 self.download_progress.emit(json.dumps({
                     "app_id": app_id, "status": "Running DepotDownloaderMod...", "progress": 35
                 }))
@@ -2572,12 +3750,47 @@ class WebBridge(QObject):
                     "WARNING", "Network error", "[Pre-allocation", "[!",
                 )
 
+                # DDMod prints lines like "  12.34% Downloaded ..." through
+                # the depot loop. Scrape those out and forward as a real
+                # progress update to the JS download tracker so the bar
+                # actually moves instead of sticking at 35% the whole
+                # time. DDMod's own throttled output already caps at
+                # ~5 lines/sec via depot_downloader's reader.
+                _DDMOD_PCT_RE = re.compile(r"^\s*(\d{1,3}(?:\.\d+)?)%\s")
+                # Map DDMod's 0-100 onto the 35-95 slice the UI uses
+                # for "running download" so we don't snap back to 35
+                # mid-flight or pre-empt the 95% "Updating tracker" stage.
+                _DDMOD_FLOOR = 35.0
+                _DDMOD_CEIL = 95.0
+                _last_pct = [-1.0]
+
                 def _print_fn(msg):
                     import re as _re, time as _t
                     clean = _re.sub(r'\x1b\[[0-9;]*m', '', msg).strip()
                     if not clean:
                         return
                     now = _t.monotonic()
+
+                    pct_match = _DDMOD_PCT_RE.match(clean)
+                    if pct_match:
+                        try:
+                            raw = float(pct_match.group(1))
+                        except ValueError:
+                            raw = -1.0
+                        if 0.0 <= raw <= 100.0:
+                            mapped = _DDMOD_FLOOR + (raw / 100.0) * (_DDMOD_CEIL - _DDMOD_FLOOR)
+                            mapped_int = int(mapped)
+                            if mapped_int != int(_last_pct[0]):
+                                _last_pct[0] = mapped
+                                try:
+                                    self.download_progress.emit(json.dumps({
+                                        "app_id": app_id,
+                                        "status": f"Downloading depot files... {raw:.1f}%",
+                                        "progress": mapped_int,
+                                    }))
+                                except Exception:
+                                    pass
+
                     if not clean.startswith(_PASS_PREFIXES) and now - _last_emit[0] < 0.2:
                         return
                     _last_emit[0] = now
@@ -2609,7 +3822,29 @@ class WebBridge(QObject):
                 except Exception:
                     pass
 
-                return (ok, "Download complete" if ok else "DepotDownloaderMod reported failure")
+                if ok:
+                    return (True, "Download complete")
+                # Build a more specific failure message: did EVERY depot exit
+                # non-zero, or just some? Did the install dir end up empty?
+                _failed_dir = (
+                    dest / "steamapps" / "common" / installdir
+                    if installdir else None
+                )
+                if _failed_dir and not any(_failed_dir.glob("*")):
+                    return (
+                        False,
+                        "DepotDownloaderMod failed for every depot. "
+                        "Common causes: anonymous CDN fetch fell through "
+                        "(missing manifest pin), Steam blocked the depot, "
+                        "or .NET 9 runtime failed to spawn. Check the "
+                        "console output above for the per-depot exit code.",
+                    )
+                return (
+                    False,
+                    "DepotDownloaderMod completed with errors. "
+                    "Some depots downloaded; check the console output for "
+                    "which depots exited non-zero before retrying.",
+                )
 
             except Exception as e:
                 logger.exception("download_game_ddmod failed: %s", e)
@@ -2781,7 +4016,21 @@ class WebBridge(QObject):
                             [hg.app_id for hg in candidates]
                         )
                         for hg in candidates:
-                            tags = plat_map.get(hg.app_id, {"_unknown"})
+                            meta = plat_map.get(hg.app_id) or {}
+                            tags = meta.get("platforms") or {"_unknown"}
+                            store_type = (meta.get("type") or "").lower()
+                            parent_appid = meta.get("parent_appid")
+                            delisted_blank = bool(meta.get("delisted_blank"))
+                            # Structural DLC drops: parent appid set
+                            # (and not a re-release), blank delisted
+                            # entry, or non-game type.
+                            if parent_appid and store_type != "rerelease":
+                                continue
+                            if delisted_blank:
+                                continue
+                            if store_type and store_type not in ("game", "demo", "mod", "rerelease"):
+                                continue
+                            # Drop non-Windows-only entries.
                             if "_unknown" not in tags and "windows" not in tags:
                                 continue
                             results.append({
@@ -2858,6 +4107,16 @@ class WebBridge(QObject):
         try:
             if not self._steam_path:
                 return "[]"
+            # Cache the full disk walk for a few seconds. Going to the Library
+            # tab fires get_installed_games + load_library + lure-fix sweep
+            # back-to-back, all of which would re-walk every drive letter and
+            # re-parse every .acf otherwise. DaemonCipher saw the GUI freeze
+            # for ~1s every time he came back to Library on a 35-game library.
+            import time as _t
+            _now = _t.monotonic()
+            _cached = getattr(self, '_installed_games_cache', None)
+            if _cached and (_now - _cached[0]) < 5.0:
+                return _cached[1]
             from sff.storage.vdf import get_steam_libs
             import os
             libs = list(get_steam_libs(self._steam_path))
@@ -2911,7 +4170,9 @@ class WebBridge(QObject):
                     except Exception:
                         continue
             games.sort(key=lambda g: g.get("name", "").lower())
-            return json.dumps(games)
+            payload = json.dumps(games)
+            self._installed_games_cache = (_now, payload)
+            return payload
         except Exception:
             return "[]"
 
@@ -3041,7 +4302,13 @@ class WebBridge(QObject):
             if app_id_int is None:
                 return (False, "Invalid App ID")
 
-            # Always remove the stplug-in Lua (both modes)
+            # Lua deletion is the primary remove step in both modes. When
+            # LumaCore is loaded, its DirWatch fires on the .lua delete
+            # and emits CAppOverview_Change so Steam's library updates
+            # live, no restart needed. If LumaCore isn't loaded yet the
+            # user has to restart Steam for the game to disappear from
+            # the library, which is what bit Svph (delete returned OK
+            # but the game stayed in Steam's UI).
             lua_removed = False
             if self._steam_path:
                 try:
@@ -3052,12 +4319,13 @@ class WebBridge(QObject):
                     logger.warning("delete_game: stplug-in Lua removal failed: %s", e)
 
             if mode != "full":
-                return (True, "Removed from library" + (" (Lua unregistered)" if lua_removed else ""))
+                if lua_removed:
+                    return (True, "Removed from library. If the game still shows in Steam, restart Steam (or run Auto LC Setup if you haven't yet).")
+                return (True, "Removed from library")
 
-            # --- Delete game files (mode='full') ---
+            # mode='full' also wipes the ACF manifest + the game folder.
             files_deleted = False
 
-            # Delete the ACF manifest
             if self._steam_path:
                 try:
                     from sff.storage.vdf import get_steam_libs
@@ -3070,7 +4338,6 @@ class WebBridge(QObject):
                 except Exception as e:
                     logger.warning("delete_game: ACF removal failed: %s", e)
 
-            # Delete the game folder
             if game_path:
                 p = Path(game_path)
                 if p.exists() and p.is_dir():
@@ -3081,8 +4348,8 @@ class WebBridge(QObject):
                         logger.warning("delete_game: folder removal failed: %s", e)
 
             if files_deleted:
-                return (True, "Game removed and deleted from disk")
-            return (True, "Removed from library (game folder not found or already gone)")
+                return (True, "Game removed and deleted from disk. Restart Steam if it still shows in the library.")
+            return (True, "Removed from library (game folder not found or already gone). Restart Steam if it still shows in the library.")
 
         def _on_done(result):
             if isinstance(result, tuple):
@@ -3499,25 +4766,42 @@ class WebBridge(QObject):
 
 
 def _fetch_steam_platforms(app_ids):
-    """Look up Windows / macOS / Linux availability for each appid via
-    Steam's `appdetails?filters=platforms` endpoint.
+    """Look up Steam metadata for each appid via batched
+    `IStoreBrowseService/GetItems/v1` calls.
 
-    Returns a dict mapping appid (int) -> set of platform tags. The
-    sentinel set `{"_unknown"}` means Steam returned no data (404,
-    delisted, parse failure); the caller treats that as "platform
-    unknown, keep the row" so we never hide classics Steam doesn't
-    surface anymore. Uses the in-process `_STEAM_PLATFORM_CACHE`
-    to avoid hammering the rate-limited endpoint on repeat searches.
+    Returns a dict mapping appid (int) -> dict with four keys:
+      'platforms'       : set of lowercase tags ("windows", "macos",
+                          "linux") or `{"_unknown"}` when GetItems
+                          returned no platform data
+      'type'            : Steam's app type integer mapped to a
+                          lowercase string ('game', 'dlc', 'demo',
+                          'mod', 'tool', 'video', 'music',
+                          'advertising'); '' when GetItems returned
+                          no body for the appid
+      'parent_appid'    : int when this appid is a DLC of another app
+                          (Steam exposes this only for DLCs); None
+                          for base games and demos
+      'delisted_blank'  : True when GetItems returned the appid as a
+                          row with no name and no type. Steam strips
+                          all public metadata for fully removed
+                          entries; classic delisted GAMES still
+                          return name + type=0 (verified for GTA SA
+                          classic, Resident Evil HD, Dark Souls PTDE
+                          Edition, etc), so this flag is a strong
+                          "this is removed-from-store DLC content"
+                          signal
 
-    `filters=platforms` returns the smallest payload that still
-    carries the windows/mac/linux booleans. The `basic` filter
-    drops the platforms block entirely on current Steam responses
-    (verified May 2026), so use the per-section filter instead.
+    Callers use `parent_appid` and `delisted_blank` as STRUCTURAL DLC
+    drop signals — no name-keyword matching required. `platforms` is
+    used to drop macOS-only / Linux-only ports.
 
-    Steam's appdetails API is rate-limited to ~200 req / 5 min
-    per IP. Loop one appid at a time, bail early after 3
-    consecutive failures so a transient throttle doesn't stall the
-    whole search worker.
+    Switched from `appdetails` to `GetItems` because appdetails enforces
+    a strict ~200 req / 5 min rate limit that returned HTTP 429 mid-flow
+    on heavy searches. GetItems batches up to ~50 appids per request
+    and has no per-IP rate limit visible.
+
+    Uses the in-process `_STEAM_PLATFORM_CACHE` to avoid refetching
+    on repeat searches.
     """
     if not app_ids:
         return {}
@@ -3525,8 +4809,8 @@ def _fetch_steam_platforms(app_ids):
     import urllib.request as _req
     import urllib.parse as _urlparse
 
-    out: dict[int, set] = {}
-    pending = []
+    out: dict[int, dict] = {}
+    pending: list[int] = []
     for raw in app_ids:
         try:
             aid = int(raw)
@@ -3540,50 +4824,130 @@ def _fetch_steam_platforms(app_ids):
         else:
             pending.append(aid)
 
+    if not pending:
+        return out
+
+    # Batch in chunks. 50 per call is conservative; Steam accepts more
+    # but the URL grows fast. After two consecutive batch failures we
+    # bail and mark everything else unknown so a transient outage
+    # doesn't stall the whole search worker.
+    chunk_size = 50
     consecutive_failures = 0
-    for aid in pending:
-        if consecutive_failures >= 3:
-            # Steam started rate-limiting or the network is dead.
-            # Mark the rest as unknown so we don't churn.
-            _STEAM_PLATFORM_CACHE[aid] = {"_unknown"}
-            out[aid] = {"_unknown"}
+    blank_default = {
+        "platforms": {"_unknown"},
+        "type": "",
+        "parent_appid": None,
+        "delisted_blank": False,
+    }
+    for start in range(0, len(pending), chunk_size):
+        chunk = pending[start:start + chunk_size]
+        if consecutive_failures >= 2:
+            for aid in chunk:
+                cached = dict(blank_default)
+                _STEAM_PLATFORM_CACHE[aid] = cached
+                out[aid] = cached
             continue
         try:
-            qs = _urlparse.urlencode({
-                "appids": str(aid),
-                "filters": "platforms",
-                "cc": "us",
-                "l": "en",
-            })
-            url = f"https://store.steampowered.com/api/appdetails?{qs}"
+            payload = {
+                "ids": [{"appid": aid} for aid in chunk],
+                "context": {"language": "english", "country_code": "US"},
+                "data_request": {
+                    "include_assets": False,
+                    "include_platforms": True,
+                    "include_basic_info": False,
+                    "include_release": False,
+                },
+            }
+            url = (
+                "https://api.steampowered.com/IStoreBrowseService/GetItems/v1?input_json="
+                + _urlparse.quote(_json.dumps(payload, separators=(",", ":")))
+            )
             request = _req.Request(url, headers={"User-Agent": "Mozilla/5.0 SteaMidra"})
-            with _req.urlopen(request, timeout=4, context=_get_ssl_ctx()) as resp:
-                payload = _json.loads(resp.read())
-            entry = payload.get(str(aid)) if isinstance(payload, dict) else None
-            if not entry or not entry.get("success"):
-                _STEAM_PLATFORM_CACHE[aid] = {"_unknown"}
-                out[aid] = {"_unknown"}
-                consecutive_failures = 0
-                continue
-            data = entry.get("data") or {}
-            plats_raw = data.get("platforms") or {}
-            tags: set[str] = set()
-            if plats_raw.get("windows"):
-                tags.add("windows")
-            if plats_raw.get("mac"):
-                tags.add("macos")
-            if plats_raw.get("linux"):
-                tags.add("linux")
-            if not tags:
-                tags = {"_unknown"}
-            _STEAM_PLATFORM_CACHE[aid] = tags
-            out[aid] = tags
+            with _req.urlopen(request, timeout=8, context=_get_ssl_ctx()) as resp:
+                data = _json.loads(resp.read())
+            seen: set[int] = set()
+            for item in (data.get("response") or {}).get("store_items", []) or []:
+                aid = item.get("appid")
+                if not isinstance(aid, int):
+                    continue
+                seen.add(aid)
+                name = item.get("name") or ""
+                type_int = item.get("type")
+                related = item.get("related_items") or {}
+                parent_appid = related.get("parent_appid")
+                if isinstance(parent_appid, int) and parent_appid <= 0:
+                    parent_appid = None
+
+                # Steam strips name + type from fully delisted entries.
+                # Classic GAMES that the store hides keep name + type=0
+                # (verified on GTA SA classic, Dark Souls PTDE, etc), so
+                # an empty body really does mean "this is removed-from-
+                # store DLC content".
+                delisted_blank = (not name) and (type_int is None)
+
+                plats_raw = item.get("platforms")
+                tags: set[str] = set()
+                if isinstance(plats_raw, dict):
+                    if plats_raw.get("windows"):
+                        tags.add("windows")
+                    if plats_raw.get("mac"):
+                        tags.add("macos")
+                    if plats_raw.get("steamos_linux") or plats_raw.get("linux"):
+                        tags.add("linux")
+                if not tags:
+                    tags = {"_unknown"}
+
+                # GetItems uses int type codes. Map to lowercase
+                # strings so callers can match on 'dlc' / 'music' /
+                # 'video' / 'tool' / 'advertising' / 'rerelease' string
+                # forms. `type: 14` with a `parent_appid` set is Steam's
+                # re-release marker for Enhanced Edition / Definitive
+                # Edition / GOTY / Director's Cut entries that share an
+                # appid arrangement with DLC but ship as full games
+                # (Metro Exodus EE 1449560, etc). Tag those as
+                # "rerelease" so the search filter can keep them.
+                type_str = ""
+                if isinstance(type_int, int):
+                    type_str = {
+                        0: "game",
+                        2: "dlc",
+                        3: "demo",
+                        4: "dlc",
+                        5: "advertising",
+                        6: "mod",
+                        7: "tool",
+                        9: "video",
+                        10: "video",
+                        11: "video",
+                        12: "video",
+                        13: "music",
+                        14: "rerelease",
+                        15: "video",
+                    }.get(type_int, str(type_int))
+
+                cached = {
+                    "platforms": tags,
+                    "type": type_str,
+                    "parent_appid": parent_appid,
+                    "delisted_blank": delisted_blank,
+                }
+                _STEAM_PLATFORM_CACHE[aid] = cached
+                out[aid] = cached
+            # Anything we asked about that GetItems silently dropped
+            # gets the unknown sentinel.
+            for aid in chunk:
+                if aid not in seen:
+                    cached = dict(blank_default)
+                    _STEAM_PLATFORM_CACHE[aid] = cached
+                    out[aid] = cached
             consecutive_failures = 0
         except Exception as e:
-            logger.debug("Steam appdetails platform lookup failed for %s: %s", aid, e)
+            logger.debug("Steam GetItems lookup failed for chunk starting at %s: %s", chunk[0], e)
             consecutive_failures += 1
-            _STEAM_PLATFORM_CACHE[aid] = {"_unknown"}
-            out[aid] = {"_unknown"}
+            for aid in chunk:
+                cached = dict(blank_default)
+                _STEAM_PLATFORM_CACHE[aid] = cached
+                out[aid] = cached
     return out
 
 
@@ -3633,16 +4997,18 @@ def _fetch_steam_image_urls(app_ids):
 _STEAM_APPLIST_CACHE = None
 _STEAM_APPLIST_CACHE_TIME = 0.0
 
-# In-process cache of Steam appdetails platform info for Hubcap-only entries.
-# Maps appid (int) -> set of lowercase platform tags ("windows", "macos",
-# "linux") or the sentinel set {"_unknown"} when Steam returned no data.
-# Steam's appdetails API rate-limits aggressively (200 req / 5 min), so we
-# cache responses for the lifetime of the process and never refetch.
-_STEAM_PLATFORM_CACHE: "dict[int, set[str]]" = {}
+# In-process cache of Steam GetItems metadata for Hubcap-only entries.
+# Maps appid (int) -> dict with keys 'platforms' (set of lowercase tags
+# or {"_unknown"}), 'type' (str), 'parent_appid' (int or None), and
+# 'delisted_blank' (bool — True when GetItems returned the appid with
+# no name and no type, the strongest "Steam removed all metadata"
+# signal we have). The DLC filter uses parent_appid + delisted_blank
+# as structural drop signals; no name keywords involved.
+_STEAM_PLATFORM_CACHE: "dict[int, dict]" = {}
 
 _NONGAME_NAME_KW = ("soundtrack", "art book", "artbook", " ost", "music pack", "digital artbook")
 
-_NON_GAME_TYPES = frozenset({2, 4, 6, 7, 9, 10, 11, 12, 13, 14})
+_NON_GAME_TYPES = frozenset({2, 4, 6, 7, 9, 10, 11, 12, 13})
 
 
 def _normalize_for_search(text):
@@ -3888,7 +5254,7 @@ def _load_steam_applist():
     return _STEAM_APPLIST_CACHE or []
 
 
-def _search_steam_catalog(query, offset, per_page):
+def _search_steam_catalog(query, offset, per_page, sort_by='updated'):
     """Fallback store search using full Steam public app list when Hubcap is unavailable."""
     apps = _load_steam_applist()
     if not apps:
@@ -3903,6 +5269,20 @@ def _search_steam_catalog(query, offset, per_page):
                 a for a in apps
                 if _matches_normalized(q_norm, _normalize_for_search(a.get("name", "")))
             ]
+    # Apply user-selected sort BEFORE pagination. Without this every page
+    # was paginated in raw Steam-applist order (lowest appid first), which
+    # is what made every sort method produce the same result.
+    sb = (sort_by or 'updated').lower()
+    if sb == 'name_asc':
+        apps = sorted(apps, key=lambda a: (a.get('name') or '').lower())
+    elif sb == 'name_desc':
+        apps = sorted(apps, key=lambda a: (a.get('name') or '').lower(), reverse=True)
+    elif sb == 'oldest':
+        apps = sorted(apps, key=lambda a: a.get('appid') or 0)
+    elif sb == 'newest':
+        apps = sorted(apps, key=lambda a: a.get('appid') or 0, reverse=True)
+    # 'updated' falls through to natural Hubcap-merge order (Steam's own
+    # latest-updates ordering is set by the Hubcap overlay later).
     total = len(apps)
     page_apps = apps[offset: offset + per_page]
     app_ids = [a["appid"] for a in page_apps if a.get("appid")]

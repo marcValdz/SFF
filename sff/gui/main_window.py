@@ -20,8 +20,8 @@ import re
 import sys
 from pathlib import Path
 
-from PyQt6.QtCore import QObject, QThread, QTimer, QUrl, pyqtSignal
-from PyQt6.QtGui import QTextCursor
+from PyQt6.QtCore import QEasingCurve, QEvent, QObject, QPropertyAnimation, QThread, QTimer, QUrl, Qt, pyqtSignal
+from PyQt6.QtGui import QColor, QPixmap, QTextCursor
 from PyQt6.QtWebChannel import QWebChannel
 from PyQt6.QtWebEngineCore import QWebEngineSettings
 from PyQt6.QtWebEngineWidgets import QWebEngineView
@@ -32,6 +32,7 @@ from PyQt6.QtWidgets import (
     QDialogButtonBox,
     QFileDialog,
     QFormLayout,
+    QGraphicsOpacityEffect,
     QGroupBox,
     QHBoxLayout,
     QInputDialog,
@@ -51,7 +52,7 @@ from PyQt6.QtWidgets import (
 )
 
 from sff.gui.log_window import GlobalLogWindow, QtLogHandler
-from sff.gui.themes import THEMES
+from sff.gui.themes import THEMES, theme_background
 from sff.i18n import T
 from sff.structs import MainMenu, MainReturnCode
 
@@ -152,11 +153,26 @@ class SFFMainWindow(QMainWindow):
         self._web_log_buffer: list[str] = []
         self._web_log_buffer_max = 200
         self._web_log_dropped = 0
+        # Same idea on the Qt-side log surfaces (the dockable
+        # GlobalLogWindow and the legacy menubar QTextEdit). Each
+        # print() from the worker thread used to fire the signal
+        # synchronously and run insertHtml + 2 moveCursor calls per
+        # line on the GUI thread. The Steam-option download path
+        # prints hundreds of lines per depot and that locked up the
+        # whole window for the duration. Now we buffer and drain
+        # every 100ms so a print burst becomes one batched insert.
+        self._qt_log_buffer: list[str] = []
+        self._qt_log_buffer_max = 400
+        self._qt_log_dropped = 0
         from PyQt6.QtCore import QTimer as _QTimer
         self._web_log_flush_timer = _QTimer(self)
         self._web_log_flush_timer.setInterval(100)
         self._web_log_flush_timer.timeout.connect(self._flush_web_log_buffer)
         self._web_log_flush_timer.start()
+        self._qt_log_flush_timer = _QTimer(self)
+        self._qt_log_flush_timer.setInterval(100)
+        self._qt_log_flush_timer.timeout.connect(self._flush_qt_log_buffer)
+        self._qt_log_flush_timer.start()
         self._game_list = []
         self._stream_emitter = StreamEmitter()
         self._log_window = GlobalLogWindow(self)
@@ -169,7 +185,7 @@ class SFFMainWindow(QMainWindow):
         self._log_handler.record_emitted.connect(self._forward_log_to_web)
         __import__('logging').getLogger().addHandler(self._log_handler)
         self._stream_emitter.text_written.connect(self._forward_stdout_to_web)
-        self._stream_emitter.text_written.connect(self._log_window.append_text)
+        self._stream_emitter.text_written.connect(self._buffer_qt_log)
         self._worker = None
         self._worker_thread = None
         self.setWindowTitle("SteaMidra")
@@ -197,6 +213,26 @@ class SFFMainWindow(QMainWindow):
 
         # ── New Web UI (visible by default) ──
         self._web_view = QWebEngineView()
+        # Mark the view as opaque so Qt's drag/resize/paint pipeline skips
+        # the parent-erase step under it. Without this, every drag tick on
+        # Windows DWM hands the compositor a frame where the parent gets
+        # erased to the platform default background under the WebEngine
+        # surface for one frame before the renderer's texture lands on top,
+        # producing the brief white / checker flash users see during drag,
+        # download start, and theme switches. The flash is worse on dark
+        # themes because the contrast is higher.
+        # Windows-only. On Linux these attributes interact badly with
+        # X11 + Mesa compositors and the page doesnt paint. 6.2.3
+        # didnt set them and rendered fine on Mint, so leave the
+        # default Qt opaque painting for Linux.
+        if sys.platform == "win32":
+            try:
+                from PyQt6.QtCore import Qt as _Qt
+                self._web_view.setAttribute(_Qt.WidgetAttribute.WA_OpaquePaintEvent, True)
+                self._web_view.setAttribute(_Qt.WidgetAttribute.WA_NoSystemBackground, True)
+                self._web_view.setAutoFillBackground(False)
+            except Exception:
+                pass
         root_layout.addWidget(self._web_view)
         self._web_channel = QWebChannel()
         from sff.gui.web_bridge import WebBridge
@@ -207,6 +243,7 @@ class SFFMainWindow(QMainWindow):
         self._web_view.page().settings().setAttribute(
             QWebEngineSettings.WebAttribute.LocalContentCanAccessRemoteUrls, True
         )
+        self._install_web_splash()
         self._web_ui_active = True
         self._web_ui_loaded = False
 
@@ -501,7 +538,9 @@ class SFFMainWindow(QMainWindow):
         )
         logs_action = menubar.addAction("Logs")
         logs_action.triggered.connect(self._show_log_window)
-        self._stream_emitter.text_written.connect(self._append_log)
+        # The legacy menubar QTextEdit is hidden by default but the
+        # connection used to fire per-line and burn cycles even when
+        # invisible. Route it through the same Qt-side log buffer.
         # Only persist the Qt fallback theme if there was no saved theme or the saved
         # theme is a known Qt theme. Web-only themes (photo themes, extra color themes)
         # are not in THEMES but must not be overwritten here.
@@ -518,6 +557,95 @@ class SFFMainWindow(QMainWindow):
         self._save_watcher_timer = QTimer(self)
         self._save_watcher_timer.timeout.connect(self._run_background_save_watcher)
         self._start_save_watcher()
+        # 6.2.5: per-app update-available periodic timer. The tick runs
+        # every 5 minutes, walks app_list_man, applies per-app overrides
+        # and the global gate, and dispatches at most one
+        # check_game_update call per app per UPDATE_CHECK_INTERVAL_MIN.
+        # Cross-app dispatches are paced one per 2 seconds via
+        # QTimer.singleShot chaining.
+        self._update_check_timer = QTimer(self)
+        self._update_check_timer.timeout.connect(self._run_update_check_tick)
+        self._update_check_dispatched_at: dict[str, float] = {}
+        self._update_check_pending_queue: list[str] = []
+        self._update_check_dispatching = False
+        self._update_check_timer.start(5 * 60 * 1000)
+        # First tick after a short delay so the UI settles before the
+        # initial sweep fires.
+        QTimer.singleShot(15 * 1000, self._run_update_check_tick)
+
+        # 6.2.6: surface a leftover updater log if the previous launch's
+        # in-place update bat hit an error. The bat runs headless, so a
+        # robocopy failure (locked _internal\, antivirus, partial copy)
+        # otherwise dies silently and the user keeps running the old
+        # build without knowing why. Cleanup the log after surfacing so
+        # subsequent launches don't re-warn.
+        QTimer.singleShot(2 * 1000, self._surface_stale_updater_log)
+
+    def _surface_stale_updater_log(self):
+        try:
+            from pathlib import Path
+            import sys
+            if not getattr(sys, "frozen", False):
+                return
+            app_dir = Path(sys.executable).resolve().parent
+
+            # Sweep leftovers from a previous in-place update. The bat
+            # cleans these up on success AND failure now, but a user who
+            # rebooted mid-update, or who hit Ctrl-C on the headless cmd
+            # window, can still leave them on disk. Reported case: a
+            # 6.2.5 installer ran, the bat copied the new files, the
+            # user rebooted before the bat reached its cleanup step,
+            # and the next launch saw `tmp_update\` (a full copy of the
+            # build the user had just upgraded to) plus `update.zip`
+            # sitting next to the EXE. The leftovers don't break
+            # anything but they're confusing and waste a few hundred MB.
+            for stale_name in ("tmp_update", "update.zip", "update.rar"):
+                stale_path = app_dir / stale_name
+                if not stale_path.exists():
+                    continue
+                try:
+                    if stale_path.is_dir():
+                        import shutil as _shutil
+                        _shutil.rmtree(stale_path, ignore_errors=True)
+                    else:
+                        stale_path.unlink()
+                    logger.info("updater leftover swept: %s", stale_path.name)
+                except OSError as exc:
+                    logger.debug("could not sweep updater leftover %s: %s",
+                                 stale_path, exc)
+
+            log_path = app_dir / "tmp_updater.log"
+            if not log_path.exists():
+                return
+            text = ""
+            try:
+                text = log_path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                pass
+            failed = "FAIL" in text or "WARN" in text
+            try:
+                log_path.unlink()
+            except OSError:
+                pass
+            if not text:
+                return
+            level = "warning" if failed else "info"
+            tail = "\n".join(text.strip().splitlines()[-12:])
+            msg = "Last in-place update reported an issue:\n\n" + tail if failed \
+                  else "Update applied. Last log:\n\n" + tail
+            try:
+                logger.warning("updater log (%s):\n%s", level, tail) if failed \
+                    else logger.info("updater log:\n%s", tail)
+            except Exception:
+                pass
+            if failed:
+                try:
+                    from PyQt6.QtWidgets import QMessageBox
+                    QMessageBox.warning(self, "SteaMidra update — issue", msg)
+                except Exception:
+                    pass
+        except Exception:
+            logger.debug("_surface_stale_updater_log crashed", exc_info=True)
 
     # ── Path / game source helpers ───────────────────────────────
 
@@ -628,9 +756,130 @@ class SFFMainWindow(QMainWindow):
                 "Web UI not found at %s", index_path
             )
 
+    # ── Web UI splash overlay ────────────────────────────────────
+    #
+    # QtWebEngine paints a white surface for a few hundred ms between widget
+    # show and the first frame from the renderer. The splash sits on top of
+    # the QWebEngineView until index.html signals loadFinished(True), then
+    # fades out over 150 ms. The label is parented to the view (not the
+    # main window) so it does not register as a separate top-level window
+    # or earn a taskbar entry.
+
+    def _install_web_splash(self):
+        # Linux: skip splash overlay entirely. The QLabel sitting on top
+        # of the QWebEngineView interacts badly with Mesa-on-X11 surface
+        # composition and leaves users (Sc0rthyn on Mint, Glitch on Mint)
+        # staring at the splash because the fade-out doesnt fire when the
+        # GPU swap chain is in software fallback. 6.2.3 didn't have a
+        # splash and worked fine — keeping the same default.
+        if sys.platform != "win32":
+            self._web_splash = None
+            self._web_splash_anim = None
+            self._web_splash_effect = None
+            return
+
+        bg_hex = theme_background(self._current_theme)
+
+        # QtWebEngine paints white before the page is up. setBackgroundColor
+        # on the page plus an opaque widget background sheet means the
+        # transition under the splash matches the theme.
+        try:
+            self._web_view.page().setBackgroundColor(QColor(bg_hex))
+        except Exception:
+            pass
+        self._web_view.setStyleSheet(f"background-color: {bg_hex};")
+
+        splash = QLabel(self._web_view)
+        splash.setObjectName("WebSplashOverlay")
+        splash.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        splash.setStyleSheet(
+            f"QLabel#WebSplashOverlay {{ background-color: {bg_hex}; }}"
+        )
+        splash.setAutoFillBackground(True)
+
+        for candidate in ("SFF.png", "SFF.ico"):
+            try:
+                from sff.utils import root_folder as _root_folder
+                logo_path = _root_folder() / candidate
+            except Exception:
+                logo_path = Path(candidate)
+            if logo_path.exists():
+                pix = QPixmap(str(logo_path))
+                if not pix.isNull():
+                    splash.setPixmap(pix.scaled(
+                        256, 256,
+                        Qt.AspectRatioMode.KeepAspectRatio,
+                        Qt.TransformationMode.SmoothTransformation,
+                    ))
+                    break
+
+        splash.resize(self._web_view.size())
+        splash.raise_()
+        splash.show()
+
+        self._web_splash = splash
+        self._web_splash_anim = None
+        self._web_splash_effect = None
+
+        # Keep the splash sized to the view across resizes.
+        self._web_view.installEventFilter(self)
+
+        self._web_view.loadFinished.connect(self._on_web_view_load_finished)
+
+    def _on_web_view_load_finished(self, ok: bool):
+        if not ok:
+            return
+        splash = getattr(self, "_web_splash", None)
+        if splash is None or not splash.isVisible():
+            return
+
+        effect = QGraphicsOpacityEffect(splash)
+        effect.setOpacity(1.0)
+        splash.setGraphicsEffect(effect)
+
+        anim = QPropertyAnimation(effect, b"opacity", splash)
+        anim.setDuration(150)
+        anim.setStartValue(1.0)
+        anim.setEndValue(0.0)
+        anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+
+        def _on_finished():
+            try:
+                splash.hide()
+                splash.setGraphicsEffect(None)
+            finally:
+                self._web_splash_anim = None
+                self._web_splash_effect = None
+
+        anim.finished.connect(_on_finished)
+        # Hold strong refs; the animation and effect die with the splash if
+        # the user closes the window mid-fade.
+        self._web_splash_effect = effect
+        self._web_splash_anim = anim
+        anim.start()
+
+    def eventFilter(self, obj, event):
+        if obj is getattr(self, "_web_view", None) and event.type() == QEvent.Type.Resize:
+            splash = getattr(self, "_web_splash", None)
+            if splash is not None and splash.isVisible():
+                splash.resize(self._web_view.size())
+        return super().eventFilter(obj, event)
+
     # ── Worker management ────────────────────────────────────────
 
     def _start_worker(self, func, label: str = "action", on_done=None):
+        # Detect a stale worker thread that is "not running" but the
+        # references weren't reset yet (subprocess that opened a separate
+        # cmd window and returned can leave us in this state). Treat
+        # that as completed and proceed.
+        if self._worker_thread is not None:
+            try:
+                still_running = self._worker_thread.isRunning()
+            except Exception:
+                still_running = False
+            if not still_running:
+                self._worker_thread = None
+                self._worker = None
         if self._worker_thread is not None and self._worker_thread.isRunning():
             QMessageBox.information(self, "Busy", "An action is already running.")
             return
@@ -645,9 +894,21 @@ class SFFMainWindow(QMainWindow):
         def _on_finish(_result):
             sys.stdout = old_stdout
             sys.stderr = old_stderr
-            if self._worker_thread:
-                self._worker_thread.quit()
-                self._worker_thread.wait()
+            wt = self._worker_thread
+            if wt is not None:
+                try:
+                    wt.quit()
+                    # Cap the wait so a stuck thread doesn't freeze the
+                    # whole window. The worker subprocess (Steamless,
+                    # cmd window) has already returned by this point;
+                    # we just need the QThread event loop to drain.
+                    wt.wait(2000)
+                except Exception:
+                    pass
+                try:
+                    wt.deleteLater()
+                except Exception:
+                    pass
             self._worker_thread = None
             self._worker = None
             self._append_log(f"--- Done: {label} ---\n")
@@ -974,6 +1235,26 @@ class SFFMainWindow(QMainWindow):
         text = re.sub(r'^\d{2}:\d{2}:\d{2}\s*', '', text)
         if not text:
             return
+        # Hard-drop list for known-spammy debug patterns. These fire per
+        # filtered row during Store search and during preserver tick;
+        # they're useful in debug.log on disk but in the live log panel
+        # they pile up to hundreds of lines per query and the modern UI
+        # gets bogged down. File log keeps them for triage. Live log
+        # never sees them. The "not responding" reports during searching
+        # were caused by this exact spam.
+        if lvl == 'DEBU':
+            _SPAM_NEEDLES = (
+                'search_games: filtered Hubcap',
+                'restore_manifest: no staged copy',
+                'Cache hit for key:',
+                'Cache expired for key:',
+                'Loaded app ',
+                'Cached data for key:',
+                'Saved cache with',
+            )
+            for needle in _SPAM_NEEDLES:
+                if needle in text:
+                    return
         # Drop DEBUG lines first when the buffer is hot — debug noise
         # during parallel manifest downloads is the main offender and
         # the user can re-enable verbose logging from the log panel
@@ -1002,6 +1283,64 @@ class SFFMainWindow(QMainWindow):
             self._web_log_dropped += 1
             return
         self._web_log_buffer.append(f'[INFO] {text}')
+
+    def _buffer_qt_log(self, text: str):
+        """Buffer a print() line for the Qt-side log surfaces.
+
+        The legacy menubar QTextEdit and the dockable GlobalLogWindow
+        used to be wired straight to the StreamEmitter signal, which
+        meant every print() ran insertHtml + moveCursor on the GUI
+        thread synchronously. The Steam-option download path prints
+        hundreds of lines per depot and that turned the whole window
+        unresponsive for the length of the download (c's 10-minute
+        freeze). Buffer here, drain on the 100ms timer.
+        """
+        text = _ANSI_RE.sub("", text).strip()
+        if not text:
+            return
+        if len(self._qt_log_buffer) >= self._qt_log_buffer_max:
+            self._qt_log_dropped += 1
+            return
+        self._qt_log_buffer.append(text)
+
+    def _flush_qt_log_buffer(self):
+        """Drain buffered print() lines onto the Qt-side log surfaces.
+
+        Two consumers: the dockable GlobalLogWindow and the legacy
+        menubar QTextEdit. We join the buffered lines and run ONE
+        insertHtml / insertPlainText per surface per tick, so a 200-
+        line burst becomes 1 GUI-thread reflow instead of 200.
+        """
+        if not self._qt_log_buffer and not self._qt_log_dropped:
+            return
+        if self._qt_log_dropped > 0 and self._qt_log_buffer:
+            dropped = self._qt_log_dropped
+            self._qt_log_dropped = 0
+            try:
+                self._qt_log_buffer.append(
+                    f'(Qt log batch dropped {dropped} line(s); throttled)'
+                )
+            except Exception:
+                pass
+        try:
+            payload = '\n'.join(self._qt_log_buffer)
+        except Exception:
+            payload = ''
+        self._qt_log_buffer.clear()
+        if not payload:
+            return
+        log_window = getattr(self, '_log_window', None)
+        if log_window is not None:
+            try:
+                log_window.append_text(payload)
+            except Exception:
+                pass
+        log_text = getattr(self, 'log_text', None)
+        if log_text is not None:
+            try:
+                self._append_log(payload + "\n")
+            except Exception:
+                pass
 
     def _flush_web_log_buffer(self):
         """Drain the buffered log lines onto the QtWebChannel.
@@ -1238,6 +1577,8 @@ class SFFMainWindow(QMainWindow):
 
     def force_quit(self):
         self._save_watcher_timer.stop()
+        if hasattr(self, "_update_check_timer"):
+            self._update_check_timer.stop()
         if self._tray is not None:
             self._tray.minimize_to_tray = False
         self.close()
@@ -1274,11 +1615,28 @@ class SFFMainWindow(QMainWindow):
                     "SteaMidra is running in the system tray. Click the ^ arrow near the clock to find it.",
                 )
         else:
-            event.accept()
+            # OFF branch: the tray icon is parented to QApplication, so leaving
+            # it alive after event.accept() keeps the process running. Hide it
+            # and drop the reference so QApplication has nothing to hold onto,
+            # then quit + accept so the close finishes within ~1 s.
             if not getattr(self, "_quitting", False):
                 self._quitting = True
-                self.force_quit()
+                self._save_watcher_timer.stop()
+                if hasattr(self, "_update_check_timer"):
+                    self._update_check_timer.stop()
+                tray = self._tray
+                if tray is not None:
+                    self._tray = None
+                    try:
+                        tray.minimize_to_tray = False
+                    except Exception:
+                        pass
+                    try:
+                        tray.hide()
+                    except Exception:
+                        pass
                 QApplication.instance().quit()
+            event.accept()
 
     # ── Background save watcher ──────────────────────────────────
 
@@ -1342,6 +1700,110 @@ class SFFMainWindow(QMainWindow):
             backed_up += 1
         if backed_up:
             logger.debug('Save watcher (local): backed up %d game(s)', backed_up)
+
+    # ── 6.2.5: per-game update-available periodic check ──────────
+
+    def _run_update_check_tick(self):
+        """Walk installed apps and queue update checks under the gates.
+
+        Reads GLOBAL_UPDATE_CHECK plus UPDATE_CHECK_INTERVAL_MIN on
+        every tick so settings changes apply on the next sweep. Per-app
+        overrides come from UPDATE_CHECK_OVERRIDES. Apps already
+        dispatched within the last interval are skipped. The actual
+        bridge calls fire one per 2 seconds across all apps via
+        QTimer.singleShot chaining so the Steam CM provider is not
+        hammered.
+        """
+        import time
+        from sff.storage.settings import get_setting
+        from sff.structs import Settings as _S
+        try:
+            global_on = get_setting(_S.GLOBAL_UPDATE_CHECK)
+            if global_on is None or global_on == "":
+                global_on = False
+            if isinstance(global_on, str):
+                global_on = global_on.lower() in ("true", "1", "yes", "on")
+            if not global_on:
+                # silenced — fires every 5 minutes and the user already
+                # knows the toggle is off because they set it that way
+                return
+            try:
+                interval_min = int(get_setting(_S.UPDATE_CHECK_INTERVAL_MIN) or 60)
+            except (TypeError, ValueError):
+                interval_min = 60
+            if interval_min <= 0:
+                return
+            interval_sec = interval_min * 60
+            raw = get_setting(_S.UPDATE_CHECK_OVERRIDES) or "{}"
+            try:
+                import json as _json
+                overrides = _json.loads(raw) if isinstance(raw, str) else (raw or {})
+            except Exception:
+                overrides = {}
+            if not isinstance(overrides, dict):
+                overrides = {}
+            bridge = getattr(self, "_web_bridge", None)
+            if bridge is None or not hasattr(bridge, "check_game_update"):
+                return
+            try:
+                installed = _json.loads(bridge.get_installed_games() or "[]")
+            except Exception:
+                installed = []
+            now = time.time()
+            queued: list[str] = []
+            for game in installed:
+                app_id = str(game.get("app_id") or "").strip()
+                if not app_id or app_id == "0":
+                    continue
+                if app_id in overrides and not bool(overrides[app_id]):
+                    continue
+                last = self._update_check_dispatched_at.get(app_id, 0.0)
+                if now - last < interval_sec:
+                    continue
+                queued.append(app_id)
+            if not queued:
+                return
+            logger.info(
+                "update-check tick: queued %d app(s) (interval=%dmin)",
+                len(queued), interval_min,
+            )
+            self._update_check_pending_queue.extend(queued)
+            if not self._update_check_dispatching:
+                self._update_check_dispatching = True
+                QTimer.singleShot(0, self._drain_update_check_queue)
+        except Exception:
+            logger.debug("update-check tick crashed", exc_info=True)
+
+    def _drain_update_check_queue(self):
+        """Pop one app off the pending queue and dispatch.
+
+        Re-arms a 2-second singleShot until the queue empties. Errors
+        from the bridge call propagate through the existing
+        check_game_update path and never break the chain.
+        """
+        import time
+        try:
+            if not self._update_check_pending_queue:
+                self._update_check_dispatching = False
+                return
+            app_id = self._update_check_pending_queue.pop(0)
+            bridge = getattr(self, "_web_bridge", None)
+            if bridge is not None and hasattr(bridge, "check_game_update"):
+                try:
+                    bridge.check_game_update(str(app_id))
+                    self._update_check_dispatched_at[str(app_id)] = time.time()
+                except Exception:
+                    logger.debug(
+                        "update-check dispatch failed for app_id=%s",
+                        app_id, exc_info=True,
+                    )
+            if self._update_check_pending_queue:
+                QTimer.singleShot(2000, self._drain_update_check_queue)
+            else:
+                self._update_check_dispatching = False
+        except Exception:
+            self._update_check_dispatching = False
+            logger.debug("update-check drain crashed", exc_info=True)
 
     def _cloud_save_backup(self, cfg, steam_path, steam32_id):
         from sff.cloud_saves import (

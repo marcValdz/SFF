@@ -217,6 +217,14 @@ class Settings(Enum):
     CLOUD_PROVIDER = SettingItem("cloud_provider", "Cloud Save Provider", False, str)
     CLOUD_RCLONE_EXE = SettingItem("cloud_rclone_exe", "Cloud Save rclone Executable", False, str)
     CLOUD_RCLONE_REMOTE = SettingItem("cloud_rclone_remote", "Cloud Save rclone Remote", False, str)
+    # 6.2.9: Local-provider destination folder. Set via the Browse button on
+    # the Cloud Saves tab next to "Local Backup Folder". Empty falls back to
+    # %APPDATA%\SteaMidra\save_backups\.
+    CLOUD_LOCAL_BACKUP_DEST = SettingItem(
+        "cloud_local_backup_dest",
+        "Local Cloud-Save Backup Folder",
+        False, str,
+    )
     # 6.2.4: per-game custom save paths the user added by hand. Stored as
     # JSON {"<app_id>": "<absolute path>"} so the cloud-saves "All Save
     # Locations" scan picks them up alongside emu / Steam-userdata folders.
@@ -275,6 +283,41 @@ class Settings(Enum):
     LUMACORE_LAST_CHECK = SettingItem(
         "lumacore_last_check",
         "LumaCore Last Update Check (UTC epoch, managed automatically)",
+        False,
+        str,
+    )
+    # 6.2.5: per-game and global update-available toggle. The
+    # interval is stored as a string so the existing settings UI
+    # text path handles edits the same way SAVE_WATCHER_INTERVAL
+    # does. Defaults are applied at read time (False / 60 / "{}")
+    # so users have to opt in to background CM polling instead of
+    # getting hit with a periodic appdetails / Login Anonymous burst
+    # the moment SteaMidra launches.
+    GLOBAL_UPDATE_CHECK = SettingItem(
+        "global_update_check",
+        "Check for game updates (global default)",
+        False,
+        bool,
+    )
+    UPDATE_CHECK_INTERVAL_MIN = SettingItem(
+        "update_check_interval_min",
+        "Minutes between background update checks (default 60)",
+        False,
+        str,
+    )
+    UPDATE_CHECK_OVERRIDES = SettingItem(
+        "update_check_overrides",
+        "Per-game update check overrides (managed automatically)",
+        False,
+        str,
+    )
+    # JSON object {appid: bool}. True means SteaMidra has dropped
+    # 00_LetUpdate_override.lua into that game's stplug-in directory and
+    # the per-game "Show update available for this game" toggle is on.
+    # Managed by the per-game context menu in main_window.py.
+    GAME_UPDATE_OVERRIDE = SettingItem(
+        "game_update_override",
+        "Per-game LetUpdate override flags (managed automatically)",
         False,
         str,
     )

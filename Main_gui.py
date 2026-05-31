@@ -36,7 +36,42 @@ if sys.stdout is None:
 
 
 os.environ.setdefault('QTWEBENGINE_DISABLE_SANDBOX', '1')
-os.environ.setdefault('QTWEBENGINE_CHROMIUM_FLAGS', '--no-sandbox --ignore-gpu-blocklist --enable-gpu-rasterization --enable-zero-copy')
+# Linux + Windows share one QtWebEngine flag stack now. 6.2.3 used
+# this exact line for both platforms and Mint, Pop, Ubuntu, Fedora,
+# Windows 10/11 all rendered correctly back then. Every version since
+# tried to get clever per-session and broke at least one user. Going
+# back to one line, no detection. The Windows white-flash work is
+# gated on win32 in main_window.py via WA_OpaquePaintEvent, not via
+# stripping zero-copy here.
+#
+# NVIDIA + Mesa GBM lookup fails on some Linux distros (issue #28) and
+# the modern UI ends up blank. If the user hasn't already set their own
+# QTWEBENGINE_CHROMIUM_FLAGS, slap a CPU-render fallback on top of the
+# default on Linux ONLY. setdefault means power users with their own
+# flag stack still win. Windows path is untouched. The disable-gpu /
+# disable-features / disable-software-rasterizer stack here is what
+# Skyflizz and others used to recover their UI by switching to Classic;
+# baking it in skips the manual switch.
+if sys.platform.startswith("linux"):
+    if not os.environ.get("QTWEBENGINE_CHROMIUM_FLAGS"):
+        os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] = (
+            "--disable-gpu --disable-gpu-compositing "
+            "--disable-features=UseOzonePlatform "
+            "--disable-software-rasterizer"
+        )
+        # log line shows up in support logs once the file logger is ready;
+        # using print() before logger init falls into the same null-stderr
+        # void noop, so we'd never see this. Stash it for the logger init
+        # block below.
+        _LINUX_CHROMIUM_FALLBACK_APPLIED = True
+    else:
+        _LINUX_CHROMIUM_FALLBACK_APPLIED = False
+else:
+    _LINUX_CHROMIUM_FALLBACK_APPLIED = False
+os.environ.setdefault(
+    'QTWEBENGINE_CHROMIUM_FLAGS',
+    '--no-sandbox --ignore-gpu-blocklist --enable-gpu-rasterization --enable-zero-copy',
+)
 
 import PyQt6.QtWebEngineWidgets  # noqa: F401 - must import before QCoreApplication
 from PyQt6.QtWidgets import QApplication, QFileDialog, QMessageBox
@@ -72,6 +107,9 @@ fh.setFormatter(
     )
 )
 logger.addHandler(fh)
+
+if _LINUX_CHROMIUM_FALLBACK_APPLIED:
+    logger.info("Linux: applying Chromium GPU fallback flags")
 
 
 def get_steam_path_gui():
@@ -120,12 +158,41 @@ def main():
         sys.exit(0)
 
     _app_icon = QIcon()
-    _icon_candidates = list(("SFF.ico", "SFF.png"))
+    _icon_candidates = list(("SFF.ico", "sff.ico", "SFF.png", "sff.png"))
+    # PyInstaller onefile drops resources into _MEIPASS for the running
+    # process. relative paths fail when steamidra was launched from a
+    # different cwd (Start menu, taskbar pin), which is why a chunk of
+    # users were getting a tray icon entry with no actual icon. resolve
+    # against MEIPASS first, then app dir, then cwd as a last resort.
+    _icon_search_dirs: list[str] = []
+    try:
+        _meipass = getattr(sys, "_MEIPASS", "") or ""
+        if _meipass:
+            _icon_search_dirs.append(_meipass)
+    except Exception:
+        pass
+    try:
+        _icon_search_dirs.append(os.path.dirname(os.path.abspath(sys.argv[0])))
+    except Exception:
+        pass
+    _icon_search_dirs.append(os.getcwd())
     if sys.platform == "linux":
         _appdir = os.environ.get("APPDIR", "")
         if _appdir:
             _icon_candidates.insert(0, os.path.join(_appdir, "SteaMidra.png"))
-    for _ic in _icon_candidates:
+    _resolved_candidates: list[str] = []
+    for _name in _icon_candidates:
+        # absolute path entries (Linux APPDIR injection) get tested as-is
+        if os.path.isabs(_name):
+            _resolved_candidates.append(_name)
+            continue
+        for _d in _icon_search_dirs:
+            if not _d:
+                continue
+            _p = os.path.join(_d, _name)
+            if _p not in _resolved_candidates:
+                _resolved_candidates.append(_p)
+    for _ic in _resolved_candidates:
         _candidate = QIcon(str(_ic))
         if not _candidate.isNull():
             _app_icon = _candidate
@@ -313,6 +380,31 @@ def main():
                 pass
 
         QTimer.singleShot(0, _run_slssteam_update_check)
+
+        # Auto-install .NET 9 on first Linux launch. DepotDownloaderMod and
+        # Steamless both need it, and the user shouldn't have to dig into
+        # Linux Tools Setup before their first download. Run on a daemon
+        # thread because dotnet-install.sh takes 30-60s and would freeze
+        # the window. The 6s defer keeps it off the critical path.
+        def _maybe_install_dotnet_9_linux():
+            try:
+                from sff.dotnet_utils import get_dotnet_path, ensure_dotnet_9
+                if get_dotnet_path():
+                    return
+                logger.info("Linux: .NET 9 not found, installing in background...")
+                ensure_dotnet_9()
+            except Exception as exc:
+                logger.warning("Background .NET 9 install failed: %s", exc)
+
+        def _kick_dotnet_install():
+            import threading as _t
+            _t.Thread(
+                target=_maybe_install_dotnet_9_linux,
+                name="sff-dotnet9-bootstrap",
+                daemon=True,
+            ).start()
+
+        QTimer.singleShot(6000, _kick_dotnet_install)
 
     # A9: startup self-update popup. Defer 2s so the window paints first.
     # The whole body is wrapped so a GitHub failure or dialog construction

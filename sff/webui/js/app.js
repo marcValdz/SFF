@@ -19,7 +19,9 @@ window.App = (function() {
         Tooltips.init();
         _initSidebar();
         _initLogPanel();
+        _initEacGuideButton();
         _initGlobalListeners();
+        if (window.DlcCheck) DlcCheck.init();
 
         Bridge.onReady(function(py) {
             // Detect platform
@@ -131,6 +133,10 @@ window.App = (function() {
                         var ofStatus = document.getElementById('lc-onlinefix-status');
                         if (ofStatus) ofStatus.textContent = result.success ? (result.message || 'Done.') : (result.message || 'Failed.');
                     }
+                    if (result.task === 'workshop_auto_import') {
+                        var wsBtn = document.getElementById('action-workshop-import');
+                        if (wsBtn) { wsBtn.disabled = false; wsBtn.classList.remove('is-busy'); }
+                    }
                     if (result.task === 'api_key_connected') {
                         Store.onApiKeyAvailable('');
                     }
@@ -149,20 +155,28 @@ window.App = (function() {
             });
 
             Bridge.on('log_message', function(msg) {
-                // Python side now batches log lines and joins them
-                // with newlines so one emit can carry up to 200 lines.
-                // Split here so each line still becomes its own DOM
-                // node with the right level styling, but we only do
-                // one DOM append batch per emit (10 per second under
-                // load) instead of per producer line (thousands per
-                // second under load).
+                // Python side batches log lines and joins them with
+                // newlines so one emit can carry up to 200 lines.
+                // Split here so each line still becomes its own DOM node
+                // with the right level styling, but only one DOM append
+                // batch per emit (10/sec under load) instead of per
+                // producer line (thousands/sec under load).
                 if (typeof msg !== 'string' || msg.length === 0) return;
                 var lines = msg.split('\n');
+                // Only update the home log panel when the home page is
+                // active. The home log was getting hit on every line
+                // even when the user was on Library / Downloads, which
+                // doubled DOM work and forced two scrollTop reflows
+                // per line. That is what locked up DDMod downloads in
+                // the modern UI on Linux/XFCE and stuttered Windows.
+                var updateHomeLog = (_currentPage === 'home');
                 for (var i = 0; i < lines.length; i++) {
                     var line = lines[i];
                     if (line.length === 0) continue;
                     _appendLog(line);
-                    _appendHomeLog(line);
+                    if (updateHomeLog) {
+                        _appendHomeLog(line);
+                    }
                 }
             });
         });
@@ -222,6 +236,42 @@ window.App = (function() {
 
     var _logMinLevel = 20; // INFO by default
 
+    function _initEacGuideButton() {
+        var btn = document.getElementById('btn-eac-guide');
+        if (!btn) return;
+        btn.addEventListener('click', function(ev) {
+            ev.preventDefault();
+            ev.stopPropagation();
+            Components.showModal('eac-guide-modal');
+            _resetEacPages();
+        });
+        _wireEacTabs();
+    }
+
+    function _resetEacPages() {
+        var tabs = document.querySelectorAll('#eac-guide-modal .eac-tab');
+        var pages = document.querySelectorAll('#eac-guide-modal .eac-page');
+        tabs.forEach(function(t) { t.classList.toggle('eac-tab-active', t.getAttribute('data-page') === '1'); });
+        pages.forEach(function(p) { p.classList.toggle('hidden', p.getAttribute('data-page') !== '1'); });
+    }
+
+    function _wireEacTabs() {
+        var tabs = document.querySelectorAll('#eac-guide-modal .eac-tab');
+        if (!tabs || tabs.length === 0) return;
+        tabs.forEach(function(tab) {
+            tab.addEventListener('click', function(ev) {
+                ev.preventDefault();
+                var target = tab.getAttribute('data-page');
+                document.querySelectorAll('#eac-guide-modal .eac-tab').forEach(function(t) {
+                    t.classList.toggle('eac-tab-active', t === tab);
+                });
+                document.querySelectorAll('#eac-guide-modal .eac-page').forEach(function(p) {
+                    p.classList.toggle('hidden', p.getAttribute('data-page') !== target);
+                });
+            });
+        });
+    }
+
     function _initLogPanel() {
         // Sidebar Logs button opens the native GlobalLogWindow (independent OS window)
         var logsBtn = document.getElementById('btn-logs');
@@ -254,6 +304,31 @@ window.App = (function() {
         }
     }
 
+    // Pending scroll requests for the two log containers. Multiple
+    // appendLog calls in the same tick coalesce to ONE scroll-to-bottom
+    // via rAF, so a 200-line burst from DDMod no longer forces 200
+    // synchronous reflows of a 1000-row scroll container.
+    var _scrollLogPanelRAF = false;
+    var _scrollHomeLogRAF = false;
+
+    function _scheduleScrollLogPanel(content) {
+        if (_scrollLogPanelRAF) return;
+        _scrollLogPanelRAF = true;
+        requestAnimationFrame(function() {
+            _scrollLogPanelRAF = false;
+            content.scrollTop = content.scrollHeight;
+        });
+    }
+
+    function _scheduleScrollHomeLog(content) {
+        if (_scrollHomeLogRAF) return;
+        _scrollHomeLogRAF = true;
+        requestAnimationFrame(function() {
+            _scrollHomeLogRAF = false;
+            content.scrollTop = content.scrollHeight;
+        });
+    }
+
     function _appendLog(msg) {
         var content = document.getElementById('log-panel-content');
         if (!content) return;
@@ -279,11 +354,11 @@ window.App = (function() {
         }
 
         content.appendChild(line);
-        // Keep last 1000 lines to avoid unbounded DOM growth (prevents high RAM during downloads)
+        // Cap at 1000 lines so the DOM doesn't blow up.
         while (content.children.length > 1000) {
             content.removeChild(content.firstChild);
         }
-        content.scrollTop = content.scrollHeight;
+        _scheduleScrollLogPanel(content);
     }
 
     function _appendHomeLog(msg) {
@@ -304,11 +379,11 @@ window.App = (function() {
         line.innerHTML = '<span class="log-ts">' + ts + '</span> ' + _escapeLogHtml(msg);
 
         content.appendChild(line);
-        // Keep last 200 lines to avoid memory growth
+        // Cap at 200 lines on the home mini-log.
         while (content.children.length > 200) {
             content.removeChild(content.firstChild);
         }
-        content.scrollTop = content.scrollHeight;
+        _scheduleScrollHomeLog(content);
     }
 
     function _escapeLogHtml(str) {
@@ -1219,6 +1294,22 @@ window.App = (function() {
     }
 
     function _handleHomeAction(action) {
+        // Workshop subscribed-mods auto-import — scans the local steamapps/workshop/content/<appid>
+        // tree and enqueues every numeric subdir that does not already have a complete
+        // download under <sff_data>/downloaded_files/workshop/<wid>/.
+        if (action === 'workshop_import') {
+            var wsAppId = _getSelectedGameId();
+            if (!wsAppId) {
+                Components.showToast('warning', 'Please select a game from the dropdown first.');
+                return;
+            }
+            var btn = document.getElementById('action-workshop-import');
+            if (btn) { btn.disabled = true; btn.classList.add('is-busy'); }
+            Components.showToast('info', 'Scanning subscribed mods for App ' + wsAppId + '...');
+            Bridge.call('workshop_auto_import', wsAppId);
+            return;
+        }
+
         // Show game-picker dialog before running update_manifests
         if (action === 'update_manifests') {
             var listEl = document.getElementById('um-game-list');
@@ -1303,6 +1394,11 @@ window.App = (function() {
                 var pathInp = document.getElementById('lc-steam-path');
                 if (pathInp && steamPath && !pathInp.value) pathInp.value = steamPath;
             });
+            // Always re-probe on open. The initial probe inside _initLcSetupModal
+            // only fires once, so users who installed LumaCore later in the
+            // session would otherwise see a stale "—". Force the refresh here
+            // so the modal always shows the current installed/latest pair.
+            _refreshLcVersionInfo();
             Components.showModal('lc-setup-modal');
             return;
         }
@@ -1313,6 +1409,40 @@ window.App = (function() {
             var appIdInp = document.getElementById('lc-onlinefix-appid');
             if (appIdInp && appId) appIdInp.value = appId;
             Components.showModal('lc-online-fix-modal');
+            return;
+        }
+
+        // Steam updates block/unblock — writes BootStrapperInhibitAll to
+        // <steam>\steam.cfg. The toggle is handled by the bridge so the user
+        // sees a confirmation toast with the current state after the write.
+        if (action === 'steam_updates') {
+            Bridge.callSync('steam_updates_get_state', function(state) {
+                var current = (state || 'unknown').toString();
+                var msg;
+                if (current === 'blocked') {
+                    msg = 'Steam auto-updates are currently BLOCKED via steam.cfg.\n\n' +
+                          'Click OK to UNBLOCK them (sets BootStrapperInhibitAll=False).';
+                } else if (current === 'unblocked') {
+                    msg = 'Steam auto-updates are currently allowed.\n\n' +
+                          'Click OK to BLOCK them (sets BootStrapperInhibitAll=Enable).';
+                } else {
+                    msg = 'No steam.cfg setting detected.\n\n' +
+                          'Click OK to BLOCK Steam auto-updates by writing ' +
+                          'BootStrapperInhibitAll=Enable to <steam>\\steam.cfg.';
+                }
+                if (!window.confirm(msg)) return;
+                var nextAction = (current === 'blocked') ? 'unblock' : 'block';
+                Bridge.callWithCallback('steam_updates_set_state', nextAction, function(res) {
+                    var result = (res || '').toString();
+                    if (result === 'blocked') {
+                        Components.showToast('success', 'Steam updates BLOCKED. Restart Steam for it to take effect.');
+                    } else if (result === 'unblocked') {
+                        Components.showToast('success', 'Steam updates UNBLOCKED. Restart Steam for it to take effect.');
+                    } else {
+                        Components.showToast('error', 'Failed to update steam.cfg: ' + result);
+                    }
+                });
+            });
             return;
         }
 
@@ -1330,7 +1460,8 @@ window.App = (function() {
         var nonGameActions = [
             'download_games', 'download_manifests', 'recent_lua', 'update_manifests',
             'mute_toggle', 'remove_game', 'context_menu', 'applist_menu',
-            'check_updates', 'scan_library', 'analytics', 'auto_lc_setup', 'lc_online_fix'
+            'check_updates', 'scan_library', 'analytics', 'auto_lc_setup', 'lc_online_fix',
+            'steam_updates'
         ];
         // Outside-Steam game action
         if (_outsideMode && nonGameActions.indexOf(action) === -1) {
@@ -1367,6 +1498,14 @@ window.App = (function() {
         var appId = _getSelectedGameId();
         if (nonGameActions.indexOf(action) === -1 && !appId) {
             Components.showToast('warning', 'Please select a game from the dropdown first.');
+            return;
+        }
+
+        // DLC check has its own structured slot that emits a payload
+        // the modal handler renders. Skip the generic run_game_action
+        // path which fires-and-forgets to a stdout no one reads.
+        if (action === 'dlc_check') {
+            DlcCheck.show(appId);
             return;
         }
 
@@ -1439,7 +1578,7 @@ window.App = (function() {
         var refreshBtn = document.getElementById('lc-version-refresh');
         if (refreshBtn) {
             refreshBtn.addEventListener('click', function() {
-                _refreshLcVersionInfo();
+                _refreshLcVersionInfo(true);
             });
         }
 
@@ -1448,14 +1587,18 @@ window.App = (function() {
         _refreshLcVersionInfo();
     }
 
-    function _refreshLcVersionInfo() {
+    function _refreshLcVersionInfo(force) {
         var installedEl = document.getElementById('lc-version-installed');
         var latestEl    = document.getElementById('lc-version-latest');
         var bannerEl    = document.getElementById('lc-version-update-banner');
         if (installedEl) installedEl.textContent = 'checking...';
         if (latestEl)    latestEl.textContent    = 'checking...';
 
-        Bridge.callWithCallback('lumacore_check_update', '', function(json) {
+        // The slot accepts a string flag. "force" bypasses the 6-hour cache
+        // for explicit user-initiated checks; empty string follows the
+        // cached path for automatic refreshes.
+        var arg = force ? 'force' : '';
+        Bridge.callWithCallback('lumacore_check_update', arg, function(json) {
             var data;
             try { data = JSON.parse(json); } catch (e) { data = null; }
             if (!data) {
@@ -1466,6 +1609,9 @@ window.App = (function() {
             if (installedEl) installedEl.textContent = data.installed || 'not installed';
             if (latestEl)    latestEl.textContent    = data.latest    || 'unknown';
             if (bannerEl)    bannerEl.style.display  = data.update_available ? 'flex' : 'none';
+            if (data.error) {
+                Components.showToast('error', 'Update check failed: ' + data.error);
+            }
         });
     }
 

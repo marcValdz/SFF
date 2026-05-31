@@ -1,5 +1,267 @@
 # Changelog
 
+## 6.3.0
+
+### Store / search
+
+- Hubcap library and search calls no longer dump scary [ERRO] popups in the live log when Hubcap returns 400 or 500. The 500 cluster on cyrillic queries (RU users typing "рф" hit it constantly) and the random 503s during Hubcap outages are server-side, the client can't fix them. Now those responses log one debug line and the rest of the pipeline (Steam applist, fallback paths) fills in quietly. Real network failures (DNS, timeouts, connection reset) still surface as ERROR like before.
+
+### Store / download
+
+- SOCKS4 proxy in HTTPS_PROXY no longer crashes the Hubcap download path. httpx supports http, https, and socks5, but socks4 is unsupported and used to bubble up as `ValueError: Unknown scheme for proxy URL`. A VPN user with NekoBox/v2rayN running a socks4 listener tripped this every time. Now the env gets sanitised at process start (one WARN line listing the unsupported scheme) and individual httpx clients fall back to a direct connection if the env still has something weird in it.
+
+### LumaCore — Manifest fetch
+
+- Manifest fetch fallback now tries three providers in order instead of just one. A dead first provider doesn't break manifest resolution anymore. Single-URL config (`[manifest_fetch] url = "..."`) still works for users who want to pin one provider. New `[manifest_fetch] urls = [...]` array form lets you customise the chain.
+
+### Linux
+
+- Modern UI on Linux gets a Chromium GPU fallback flag stack baked in so NVIDIA + Mesa GBM lookup failures no longer leave the page blank. The CPU-render flags (`--disable-gpu --disable-gpu-compositing --disable-features=UseOzonePlatform --disable-software-rasterizer`) only apply when the user hasn't set their own `QTWEBENGINE_CHROMIUM_FLAGS`, so power users keep their setup. Skyflizz hit this on Mint and was switching to Classic UI to recover, baked-in fallback skips that step.
+- SLSsteam install now logs the actual 7z stdout/stderr tail when extraction fails, plus retries once after a 500ms pause for AV-mid-scan stalls. The old "Extraction failed and bin/ dir not found" line told you nothing. The next bug report at least includes the real 7z output so the cause is obvious.
+
+### README
+
+- Setup Step 1 recommends the installer first now and falls back to the ZIP only when AVs / corp policies block the installer. Antivirus warning rewrote to say what it actually is (generic packed-exe false positive, point AV at the source on github) and dropped the koaloader-era language.
+
+### Linux
+
+- Modern UI on Linux is one flag stack again. 6.2.7 / 6.2.8 tried to detect Wayland vs X11 and pick different Chromium flags per session, but the detection kept misclassifying Cinnamon-Wayland and GNOME-Wayland-with-XWayland users and dropping them into the wrong branch, which is what made the page render grey or not paint for Glitch on Mint. Reverted to the same single line 6.2.3 shipped: `--no-sandbox --ignore-gpu-blocklist --enable-gpu-rasterization --enable-zero-copy`. No more session detection, no software escape hatch env-var, just the flag stack users actually confirmed working back then.
+- Stripped the `WA_OpaquePaintEvent` / `WA_NoSystemBackground` attributes off the QWebEngineView on Linux. They were added in 6.2.6 to fix the Windows drag-flash and they help on Windows, but on Linux they conflict with how Mesa-on-X11 reports the window surface and can leave the page area unpainted on first show. Now Windows-only, Linux gets the default Qt opaque-paint behaviour (which is what 6.2.3 had).
+- Splash overlay no longer installs on Linux. The QLabel sitting on top of the QWebEngineView fades out cleanly on Windows but on Mesa-X11 the swap chain composition leaves it visible because the loadFinished fade-out timer never gets the surface ready signal it expects. Sc0rthyn hit a stuck splash on Mint. 6.2.3 didn't have a splash and rendered fine, so Linux gets the 6.2.3 default again, no overlay, just the page paints when the renderer is ready.
+
+### DLC check
+
+- DLC modal got checkboxes plus a Local files button. Every missing DLC is ticked by default, depots are disabled because they aren't standalone, and the column header has a select-all toggle. Hubcap and Ryuu still queue the parent game's full bundle (single click, all DLCs come with it). Oureveryday loops over the checked DLCs only and appends keys to the parent lua. Local files opens the manifest folder picker and runs DDMod against the parent like the Store tab does.
+- DLC check now also reads `config.vdf` depot keys, the depotcache `<id>_<gid>.manifest` filename pattern, and on Windows the `HKCU\\Software\\Valve\\Steam\\Apps\\<id>\\Installed=1` registry flag. Six sources in total before a DLC counts as missing. The 30s Steam-API ceiling is 45s now and on a hard timeout the modal still renders from the on-disk app-info cache so people stuck behind a flaky CM can still see the list. c was hitting this every time.
+- DLC check Download buttons split by source now. Hubcap and Ryuu route to the parent game's full bundle (same as the regular Store download), since both of them only ship the parent zip and trying to pull a standalone DLC through them kept failing. Oureveryday now does the right thing for per-DLC clicks: pulls just the DLC's depot manifest through the gmrc / ManifestHub / GitHub cascade, looks the depot key up in the bundled key DB, and APPENDS to the existing `<parent>.lua` instead of overwriting it. So DLC keys you add later don't wipe out the keys the parent download already wrote. If the parent lua doesn't exist yet, oureveryday seeds one with `addappid(<parent>)` plus the new DLC lines. Lawbymike and Kinge both hit the overwrite case.
+
+### Manifest downloads
+
+- Oureveryday cascade is strictly sequential, one host at a time, with its own connect+read budget per host. Order: gmrc primary, two HTTPS gmrc mirrors, ManifestHub API, GitHub raw mirror. Slow hosts can't hold up the chain anymore. Some users were getting the cascade wedged after the two new mirrors landed because all three were racing in parallel.
+
+### In-place updater (Windows frozen build)
+
+- Updater bat reverted to the 6.2.5 shape because the 6.2.6/7/8 /MIR rewrite kept wedging on locked `_internal\` DLLs and leaving users on the old build (Arxalor confirmed 6.2.5 was the last one that updated cleanly). Old shape: 3s wait, taskkill, wipe `_internal\`, robocopy /E /IS /IT, relaunch. Simple beats clever when the clever one doesn't ship.
+- Check for Updates now forces a visible "Update Available" popup as soon as the version compare fires. Some users on 6.2.5 / 6.2.8 said they clicked the menu item, the log said a newer version was found, and nothing else happened. The follow-up download confirm prompt was getting eaten by the worker-thread routing on certain setups. The popup runs straight on the GUI thread now.
+
+### Live log
+
+- Stripped the `get_setting:` debug line that fired on every settings read, the `update-check tick: GLOBAL_UPDATE_CHECK off, skipping` line that fired every 5 minutes, and the per-tile `get_game_update_state` line that fired for every game in the library on every refresh. The live log was unreadable under the spam and debug.log was filling up with thousands of repeats per minute. Real errors stay.
+- The `search_games: filtered Hubcap appid=...` lines are gated behind `SFF_VERBOSE_FILTER=1` now. Default is silent. Search would dump thousands of those per tab switch on big catalogs and bury everything else.
+
+### System tray
+
+- Tray icon resource path now resolves through PyInstaller's `_MEIPASS` and the exe directory before falling back to cwd. Some users were getting a tray entry with no actual icon because Start menu / taskbar pin shortcuts launch the exe with a different cwd than the install directory. The icon also tries `sff.ico` (lowercase) so the freeze-built name matches.
+
+### README
+
+- Added a YouTube setup walkthrough by @yensnc and a step-by-step API key tutorial by @novoagain to the README, both credited.
+
+## 6.2.9
+
+### Library tab
+
+- Library tab no longer freezes for a beat every time you switch back to it. The drive-letter walk that finds extra Steam libraries was re-running on every Library / Fix Game / Lure Fix call, parsing every `appmanifest_*.acf` each time. Now cached for 5 seconds across the whole bridge, so coming back to Library reuses the previous scan instead of redoing it. DaemonCipher hit this on a 35-game library.
+
+### Store / search
+
+- Store sort options actually sort now. "Recently Updated", "Newest", "Oldest", "Name A-Z", and "Name Z-A" all changed nothing in 6.2.8 because the Steam catalog page sliced results by raw appid order before the sort key was applied. Sort goes through before pagination now. Ivanchick reported this.
+
+### DLC check
+
+- DLC check now reads three on-disk sources before flagging a DLC as missing: SLSSteam's local applist, the parent's `<parent>.lua` under stplug-in, and the parent's `appmanifest_<id>.acf` MountedDepots block. Steam's own UI uses the same files. Batman Arkham Knight reporting "0 of 24 unlocked" while every DLC was actually installed was the Steam web check timing out and the local fallback never running. Three sources mean a single network hiccup can't make the modal lie to you.
+- DLC check Steam-side query no longer hangs forever on a flaky CM. The 'This operation would block forever' gevent error from SteamKit is now caught with a 30s ceiling and the check falls through to the store + local checks instead of getting wedged.
+
+### Cloud Saves
+
+- Local provider now has a "Local Backup Folder" picker on the Cloud Saves tab. Pick any folder on your PC and that's where every per-game backup goes (`<your folder>/Game Name [AppID]/remote/`). Setting persists across sessions. Leave it blank and the legacy `%APPDATA%\SteaMidra\save_backups\` default still works. Was an explicit ask to know where Local backups land and to be able to change it.
+
+### Manifest downloads
+
+- The encrypted gmrc primary endpoint now has two HTTPS fallback mirrors when it goes down or returns garbage. Both fallbacks travel over TLS and are kept encrypted in source the same way the primary URL is, and stay redacted in the live log. Manifest downloads keep working through the gmrc downtime windows users keep hitting.
+- Returned request codes are sanity-checked before use. Captive portals and MITM attempts on the http primary used to slip through with HTML or ad redirects in the body, which then turned into "manifest id" prompts later. Anything that isn't a numeric request code (real responses are 16-22 digit decimals) is rejected and the next fallback runs instead.
+
+### Steam-option download
+
+- The Steam-option download (the one that grabs the lua + manifests, not DDMod) no longer freezes at 10% forever. The Steam app-info call inside the lua-build step had no timeout, so a flaky Steam CM left the worker wedged at "Downloading Lua" with the bar stuck. Hard 30s ceiling now. On timeout the user gets a clear error telling them the CM is unreachable and to retry or switch source instead of staring at a frozen bar.
+
+## 6.2.8
+
+### Store / download
+
+- Steam-option downloads (the lua + manifest path, not DDMod) now actually fall back to ManifestHub when the primary GMRC endpoint is dead or 503'ing. Before, if the encrypted endpoint was down, the download just stopped after a few depots without ever asking for a ManifestHub key or trying it. Now if you have the ManifestHub API key set in Settings (or get prompted to add one), missing manifests pull from there too.
+- DDMod download progress bar moves now instead of sitting stuck at 35% for the whole download. The bar maps DDMod's own percent output onto the 35-95 range so you actually see download progress in real time.
+- DDMod log spam in the modern UI is way more controlled. The live log only updates the home page log when you're actually on the home page, and the scroll-to-bottom is rAF-throttled so a 200-line burst from DDMod is one repaint instead of 800.
+- Hubcap's "filtered DLC" debug spam during search no longer floods the live log. Those lines still go to debug.log on disk for triage but they don't reach the modern UI's live log anymore. The "not responding" reports during searching were caused by this exact spam.
+
+### Update All Games
+
+- Update All Games does what the name suggests now. First pass walks every installed game's `.acf`, skips anything in your "Exclude from Manifest Updates" list, refreshes the manifest GIDs through the same gmrc / ManifestHub / GitHub mirror cascade, and patches `InstalledDepots` + `MountedDepots` in the ACF so Steam picks the new version up. Second pass scans every `.lua` under `<steam>\config\stplug-in\` and fills in any depot whose manifest never made it to depotcache — useful for games you have a lua for but never finished installing, and for catching depots that silently failed first time around. LumaCore-locked games can finally update through SteaMidra without the manual "delete depotcache + redownload" dance.
+- New "Content Still Encrypted" tip on the home page next to the EAC and SteamStub banners. If Steam throws that error on a download or update, it just means the game's manifests are missing or stale. Run Update All Games and they'll come back. Saves the "why won't this update" question in support.
+
+### LumaCore — Lua sandbox
+
+- Plugin .lua files no longer get the full Lua standard library. The VM used to call `luaL_openlibs` which loaded io, os, package, debug, coroutine alongside the safe libs, which means a hostile lua could read arbitrary files, shell out, or pull external bytecode into the process. Whitelist load now opens base + table + string + math only, then strips dofile, loadfile, load, loadstring, require, and collectgarbage off the base lib. Every binding SteaMidra ships (addappid, setManifestid, setAppticket, etc.) keeps working because they're registered separately. Reported by 𝙈𝙊𝙇𝙀𝘾𝙐𝙇𝙀.
+
+### Live log
+
+- Live log no longer prints the encrypted GMRC endpoint URL or the upstream HTML body when it's redacted. The endpoint is encrypted on purpose and was leaking into the live log on every request.
+- "Access denied" / "accesso negato" spam from the manifest watcher is gone. That's a normal condition when Steam holds the depotcache locked, no point flooding the live log with it.
+
+### Home page
+
+- New EAC fix guide button next to the Steam DRM banner. Click "Show EAC fix steps" and you get a 7-page modal walking through verify integrity, Steam launch options, renaming the EasyAntiCheat folder, the executable swap, steam_appid.txt / .bat tricks, the firewall block, and crack files as a last resort. Methods are ranked easiest first and the modal is upfront that SteaMidra's tools (Goldberg, Remove DRM, SteamAutoCrack) don't fix EAC themselves.
+- Steam DRM banner now mentions "Application load error 6:0000065432" alongside error 53 / 54. Older games hit that popup instead, same SteamStub root cause and same Remove DRM fix.
+- Remove from library now tells you what to do if the game still shows in Steam after deleting. The lua gets deleted properly, but if LumaCore isn't loaded the running Steam keeps the appid in memory until restart. The new message says to restart Steam or run Auto LC Setup if you haven't yet.
+- Remove DRM (Steamless) doesn't crash on the second click anymore. The worker thread cleanup was leaving a stale reference in some edge cases (Steamless cmd window closing fast, second exe locked by the launcher), and the next click hit "An action is already running" forever. The cleanup now drops the stale reference and waits for the thread to drain instead of hanging the GUI thread.
+- Steamless no longer pops a separate cmd window on Windows. It still captures the output and pipes it to the live log like before, just without the flickering cmd window confusing users into thinking the app froze.
+- If Steamless can't replace the original .exe (file held by the game's launcher process, antivirus lock, etc.), it now restores the backup and tells you what to do instead of leaving both the original AND the .unpacked.exe sitting on disk.
+- DLC Check modal now has actual download buttons. Each missing DLC has its own Download button, and the footer has bulk buttons (Hubcap / Oureveryday / Ryuu) that queue every missing DLC at once through the chosen provider. Per-row downloads default to Hubcap.
+
+### Linux
+
+- Modern UI renders correctly on Mint, Pop!_OS, and pretty much every Linux desktop again. The 6.2.7 / 6.2.8-early splits between Wayland and X11 kept misclassifying sessions and dropping users into the wrong flag stack, which is what made the modern UI go grey on Glitch's Mint setup. The flag stack is back to byte-identical to 6.2.3 unconditionally for every Linux session, which is the version users actually confirmed working. `STEAMIDRA_LINUX_FORCE_SOFTWARE=1` stays as the opt-in software-render escape hatch for hopeless GPU stacks.
+
+### System tray
+
+- Tray icon fires a one-shot balloon notification on first appearance. Windows 11 hides new tray icons in the overflow menu by default, so users couldn't tell if SteaMidra was alive. The balloon now confirms the icon is up even when overflowed; right-click the system tray and enable SteaMidra in Other system tray icons to make it permanent.
+
+### Updater
+
+- 6.2.6 → 6.2.7 in-place update silently no-op'd for several users (the bat ran, the exe relaunched into the same 6.2.6 build). The bug was in the 6.2.6 bat itself and it's already fixed in the 6.2.7 bat going forward, so 6.2.7 → 6.2.8 will work normally. Users still on 6.2.6 need to manually install 6.2.7 once.
+
+## 6.2.7
+
+### In-place updater (Windows frozen build)
+
+- The updater no longer leaves `tmp_update\` and `update.zip` lying around next to the EXE after an update. Cleanup runs at the end of the bat now, success OR fail, so yall don't end up with what looks like another SteaMidra inside SteaMidra after a bad run. If something does get left behind because of a reboot or a Ctrl-C, the GUI sweeps it on next launch. The actual install itself never gets touched, only the staging junk.
+- Updater also keeps your stuff alive now. `settings.bin`, `recent_files.json`, `analytics.json`, `workshop_tracker.json`, `all_games.txt`, plus the `saved_lua\`, `backups\`, and `webengine_profile\` folders all stay untouched during an update. Old build artifacts under `_internal\` still get purged so PyInstaller doesn't pick the wrong files.
+
+### Store / download
+
+- DDMod downloads no longer freeze the modern UI on Linux or stutter the live log on Windows. DDMod prints thousands of validation and progress lines per second, and the modern UI couldn't keep up. Now those high-frequency lines get summarised once every 2 seconds while errors and warnings still come through normally.
+- Steam-option downloads (the one that just grabs the lua and manifests, not DDMod) no longer freeze the whole window. The print() output from the manifest downloader was hitting the GUI thread synchronously per line. Now it's buffered and drained on a 100ms timer so a burst of hundreds of lines doesn't lock things up. c was getting 10-minute freezes on this, gone now.
+- Live log no longer spams "access denied" / "accesso negato" every second when Steam holds the depotcache locked. Common when SteaMidra runs as admin and Steam doesn't, or vice versa. The condition is normal so it just goes to the debug log now instead of flooding the panel.
+
+### Home page
+
+- Remove from library now tells you what to do if the game still shows in Steam after deleting. The lua gets deleted properly, but if LumaCore isn't loaded the running Steam keeps the appid in memory until restart. The new message says to restart Steam or run Auto LC Setup if you haven't yet.
+
+### Linux
+
+- Modern UI no longer renders grey on Ubuntu XFCE and other X11 + lightweight WM setups. The earlier 6.2.7 flag set was tuned only for Wayland and was fighting xfwm4 on X11. Now it picks the right flag set per session: Wayland keeps the in-process-gpu flags, X11 drops them and uses the same plain GPU path Windows uses. Skyflizz and AlukardBF were both hitting this.
+- Modern UI rendered black on Wayland on a chunk of distros (NixOS, recent Fedora, Bazzite, etc). The QtWebEngine GPU process was producing frames Mesa Wayland couldn't import. Fixed with `--in-process-gpu --disable-gpu-compositing` so the dma-buf handoff is gone.
+- `STEAMIDRA_LINUX_FORCE_SOFTWARE=1` actually works now. The old version still spawned a GPU process; the new one collapses everything into one process with SwiftShader software raster. Slowest path that exists but it renders on configs where every GPU path fails.
+
+### Store / search
+
+- Metro Exodus Enhanced Edition (1449560) shows up in the Store search now. Same fix covers Mafia Definitive Edition, Crysis Remastered, Saints Row 2 Re-elected, the GTA V Enhanced Edition family, and any other Steam re-release. Steam tags these as type 14 with a parent_appid pointing at the base game, same shape as DLC, so the DLC filter was eating them by mistake. Re-releases keep going through now, DLC still gets dropped the same way.
+
+## 6.2.6
+
+### In-place updater (Windows frozen build)
+
+- 6.2.4 → 6.2.5 silently no-op'd for several users. The exe downloaded the new zip, extracted it, said "Extracting update..." and relaunched right back into 6.2.4. The bat killed the process and then tried to wipe `_internal\` immediately after, before Windows finished releasing file locks on the python and Qt DLLs, so the wipe half-failed. Robocopy then ran additive (no purge) so old 6.2.4 files stayed mixed with new 6.2.5 files, and the import order ended up resolving to the old build. The headless cmd window also swallowed every error code so a fatal failure looked like success. New bat: waits up to 30 seconds for the exe to actually exit, runs `robocopy /MIR` so stale files purge properly, excludes user data folders so settings stay alive, and writes `tmp_updater.log` next to the exe on every step. Relaunch only fires on a clean robocopy exit. Anything else aborts in place and leaves the log behind so I can triage.
+- New startup probe in the GUI reads `tmp_updater.log` a couple seconds after the window paints. Any FAIL / WARN line surfaces as a popup, then the log gets deleted so it doesn't keep firing. Headless bat windows can't swallow update failures silently anymore.
+
+### Store / search
+
+- Reverted yesterday's Hubcap filter-decision cache. The cache landed alongside an attempt to drop per-item DEBUG noise but the rewire broke result counts and tile rendering — searches were returning ~50 entries instead of the 20-row first page, results filled with raw Hubcap rows that should have been dropped, and several rows shipped without cover art. The filter loop is back to the pre-change shape that re-walks `_STEAM_PLATFORM_CACHE` per search and emits one DEBUG line per drop. Re-runs of the same query do hit the metadata cache (`_STEAM_PLATFORM_CACHE` was untouched) so they don't pay the GetItems round trip again; the only thing the rollback gives back is the per-item debug spam, which only shows up at DEBUG log level
+- Pagination on the Store tab now honours the per-page limit when Hubcap-only extras are merged in. The previous shape sliced Steam rows for the requested page, then appended every Hubcap-only row to the result regardless of which page the user was on, so page 1 rendered ~45 tiles (20 Steam plus the full Hubcap tail) and pages 2 / 3 / 4 repeated the same Hubcap tail under fresh Steam rows. The merged list is now treated as one virtual sequence: `[steam_total Steam rows] + [extras_total Hubcap rows]`, and the Hubcap tail gets sliced into the same `[offset, offset + per_page)` window the Steam slice uses. Page 1 of an empty query is back to 20 tiles, and `data.total` reports the true combined count so `Math.ceil(total / perPage)` lines up with what the user can actually scroll through
+- Hubcap-only rows shipped on the current page now resolve cover art through `IStoreBrowseService/GetItems/v1` (same path Steam rows use) before the page is emitted, so delisted classics surface with proper header.jpg artwork instead of a broken-image placeholder. Rows that aren't on the current page skip the lookup so a 200-row Hubcap library doesn't pay 200 GetItems hits per search
+
+### Window paint flicker
+
+- Dropped the white / checker flash a few users hit when dragging the SteaMidra window, starting a download, or typing into the search box, especially on dark themes. Two stacking causes. First, the Windows Chromium flag set passed `--enable-zero-copy` to QtWebEngine. Zero-copy lets the GPU hand its texture straight to DWM without a CPU bounce, which is faster, but on the Windows 10 / 11 compositor it produces a one-frame placeholder texture whenever the renderer rebinds its surface during drag, layout invalidation, or theme reload. That placeholder is what users were seeing as a checker / white flash. Removed the flag from `Main_gui.py`. GPU rasterization (`--enable-gpu-rasterization`) and the blocklist override (`--ignore-gpu-blocklist`) stay on so the store grid still rasters on the GPU. Second, the `QWebEngineView` was constructed without `WA_OpaquePaintEvent`, so Qt's drag pipeline erased the parent under the view to the platform default background for one frame before the renderer's texture landed on top. Set `WA_OpaquePaintEvent`, `WA_NoSystemBackground`, and `setAutoFillBackground(False)` on the view in `main_window` so the parent-erase step is skipped entirely. Together the two fixes make drag, theme switch, and download-start repaints opaque from frame zero
+
+### Linux
+
+- 6.2.5 wouldn't launch for a chunk of Linux users: the AppImage opened, then exited within a second. Confirmed on CachyOS, Bazzite, Nobara, recent Fedora KDE / GNOME — anything running a pure Wayland session with no XWayland fallback. Cause: the 6.2.5 Linux Chromium flag set forced `--use-gl=desktop` on top of `--disable-gpu-compositing`. `--use-gl=desktop` pins libGL with GLX, and GLX needs an X server context that pure Wayland sessions don't expose, so Chromium's renderer died during GPU init and the parent process exited. The blank-window dma-buf workaround the flag was meant to support is fully covered by `--disable-gpu-compositing` alone, since software-compositing the final frame skips the dma-buf handoff regardless of which GL backend the rasterizer picks. Pulled `--use-gl=desktop` out of the Linux flag set; Chromium auto-selects EGL on Wayland and GLX on X11 from here. Added a `STEAMIDRA_LINUX_FORCE_SOFTWARE=1` env-var escape hatch that switches to `--disable-gpu` for users who hit a GPU init failure on out-of-tree Mesa or a busted vendor driver and need to limp along until the underlying stack is fixed
+
+### Home page — game-update toggle default
+
+- The "Check for game updates" global setting is now actually OFF by default, matching the declared `Settings.GLOBAL_UPDATE_CHECK = False`. The 6.2.5 release shipped two read paths in `main_window._run_update_check_tick` and `web_bridge._app_update_check_enabled` that coerced an unset setting to `True`, so on a fresh install or an empty `settings.bin` the periodic CM sweep + appdetails burst fired automatically every 60 minutes plus once at startup. Both call sites now coerce unset / blank to `False`. Users opt in from the Settings panel or per-tile toggle
+
+### Home page — tile rename
+
+- Renamed the "Update All Manifests" home-tile to "Update All Games" with the subtitle "Refresh all installed games". Same dispatch path, same modal, same backend behaviour — only the user-visible label changed. The function still walks every installed game's `.acf` against your saved Lua files, skips entries listed under "Exclude from Manifest Updates", and pulls fresh manifests through the configured provider. The settings tooltip and the bridge's "no manifest provider" toast picked up the new name too. Locale strings updated for all 19 webui translations
+
+### LumaCore — robustness hardening
+
+- `KeyValues::ReadAsBinary` and `KeyValues::FindOrCreateKey` hooks no longer log every fire. Earlier builds wrote 30+ MB of disk traffic in under 30 seconds once Steam loaded its app list. Install / Uninstall lines stay so attach failures still show.
+- LicenseHooks keeps `OptedInMask` and `RequiresLegacyCDKey` as the only two detoured surfaces. The five extra DLC / cloud / subscription detours that were briefly added (BIsDlcEnabled, IsAppDlcInstalled, IsCloudEnabledForApp, GetSubscribedApps, BUpdateAppOwnershipTicket, BUpdateLicenses) caused random Steam crashes after a few minutes of clicking through games and flipped cloud-save on for every Lua-tracked app. Those six are gone now.
+
+## 6.2.5
+
+### Auto LC Setup
+
+- "Check for updates" inside Auto LC Setup now actually fires when the modal opens. The version row used to gate the initial probe behind the modal's one-time init, so users who opened the modal a second time saw stale dashes for installed and latest. The probe runs on every modal open now, and the Check for updates button bypasses the 6-hour cache so the user gets a fresh GitHub round-trip on demand. The slot also surfaces backend errors as a toast instead of swallowing them.
+
+### Quick Tools — Steam updates toggle
+
+- Added a Steam Updates button under Quick Tools that writes `BootStrapperInhibitAll=Enable` (block) or `BootStrapperInhibitAll=False` (unblock) into `<Steam>\steam.cfg`. Reads the current state on click, prompts with a confirmation showing what will change, then writes the file. Existing lines in `steam.cfg` are preserved; only the `BootStrapperInhibitAll` line is replaced or appended. Restart Steam for the change to take effect.
+
+### Store / download
+
+- "Direct download via DDMod" now returns a specific failure reason instead of the generic `DepotDownloaderMod reported failure` line. When zero manifests resolved for any depot, the modal shows that the lookup failed and points the user at the manifest folder drop, the source picker, or Update All Manifests. When some depots downloaded but others failed, the toast explains that and tells the user to check the per-depot exit codes in the live log. Empty install dir produces a different message that calls out missing manifest pins, blocked depots, or .NET 9 spawn failures
+- "Download older version" no longer leaks the SteamDB scraper window into Alt-Tab and the taskbar. The Chrome process now launches with `--start-minimized`, `--silent-launch`, `--no-first-run`, and a 1×1 off-screen window. When the scrape finishes (or times out) the process gets a hard `taskkill /F /T` so it can't linger in the background. Cloudflare still treats the session as a real browser because the rendering pipeline stays intact
+
+### LumaCore — robustness hardening
+
+- Lua uint64 strings now go through a strict-decimal helper before parsing. Empty input, embedded whitespace, signs, and `0x` prefixes get rejected upfront so a malformed `.lua` config errors cleanly instead of unwinding into Steam's loader.
+- DirWatch caps the configured-directory list at the Win32 wait limit before entering its loop. Beyond the cap the watcher used to die silently; now it truncates with a warning. Empty lists exit immediately.
+- DllMain pins the LumaCore module on attach so a stray `FreeLibrary` cannot unmap the DLL while hooks and worker threads are still running. On process termination the detach path skips MinHook teardown to avoid a loader-lock deadlock.
+
+### Achievements — OnlineFix stats follow-ups
+
+- Achievement and user-stats callbacks now reach OnlineFix games' callback registrations correctly. `SendCallbackToPipe` rewrites the low-24 bits of `m_nGameID` from the real appid back to 480 on `UserStatsReceived_t`, `UserStatsStored_t`, `UserAchievementStored_t`, and `UserAchievementIconFetched_t` callbacks before forwarding to the pipe. The high 40 bits stay untouched
+- `IClientUtils::GetAPICallResult` handler picks up matching dispatch entries for the three async-call result ids (`UserStatsReceived`, `GlobalAchievementPercentagesReady`, `GlobalStatsReceived`) so the same rewrite applies on the result-fetch path
+- A new pipe-scope gate (`g_StatsScopePipe`) tracks the `HSteamPipe` that originated a user-stats IPC dispatch. Callback rewrites only fire on the matching pipe, so cross-pipe bleed when worker threads share an `HSteamPipe` value can no longer mis-tag a callback. The existing thread-local depth counter stays as the coarse gate
+- `SendCallbackToPipe` also runs an additional appid-480 dispatch after the real-appid dispatch returns for OnlineFix sessions, so games whose callback registration is bound to 480 still see the callback even though Steam routed the original to the real appid pipe. Gate is `g_OnlineFixRealAppId != 0` plus the pipe match plus the four-id callback set; everything is a no-op outside an active OnlineFix session
+
+### Home page
+
+- New game-update-available badges on every library tile. A green dot means the installed buildid matches Steam's CM-published buildid and the cached state is fresh; an amber dot means an update is available; no dot means the cache is missing, stale, or in error. Click the dot for a popover with the installed buildid, the Steam buildid, and a Check now button. Useful for LumaCore-locked games where the user wants to know when an update lands without auto-updating
+- New global Settings entry "Check for game updates" plus a per-game override map (`UPDATE_CHECK_OVERRIDES`) and an interval setting (`UPDATE_CHECK_INTERVAL_MIN`, default 60). A periodic timer walks every installed game once per interval, gates on the global setting and the per-game override, and dispatches at most one Steam CM check per game per interval. Cross-game dispatches are paced one per 2 seconds
+- Splash overlay during web UI startup. The QtWebEngine renderer used to paint a white block for one to four seconds while the page warmed up. A `QLabel` parented to the view now sits over the renderer with the SteaMidra logo on the active theme background colour, fades out over 150 ms once the page reports `loadFinished(True)`, and never registers as a separate top-level window or taskbar entry
+- Workshop Item panel gains an "Import subscribed mods" action. Scans `<steam>\steamapps\workshop\content\<appid>\` for numeric subscriber IDs, dedupes against already-downloaded items, and queues the rest through the existing 4-method `download_workshop_item` cascade. Useful when Steam fails to download a chain of dependency mods that are still listed in the subscribed folder
+
+### Workshop
+
+- New ownership-bypass workshop downloader for games that block direct subscribe (Karter 2 case). Routes through `IPublishedFileService/GetDetails` plus the UGC CDN (`steamusercontent-a.akamaihd.net/ugc/<hcontent_file>/`) instead of the Steam subscribe API, so workshop items still pull when subscribe returns "No internet connection". Accepts a single item URL, a collection URL (resolved through `GetCollectionDetails` before any download starts), or a newline-separated paste list; concurrency capped at 4. The bypass path sends only the configured Web API key and never Steam session cookies, and verifies body length against `file_size` from `GetDetails` before writing the output file
+- New "Bypass download" tab in the Workshop Browser dialog. Two text fields (URL or paste list, optional Web API key override) and a Download button; per-item progress and errors stream into a list view so the user sees which IDs landed and which failed without digging through the log panel. Workshop Browser dialog is now a per-process singleton: opening while an existing instance is visible focuses the existing dialog instead of constructing a new one. The `QWebEngineProfile` is also a singleton, parented to `QApplication.instance()`, so the four Tools entries no longer paint white boxes on a second open
+
+### UI fixes
+
+- Close-to-tray toggle now actually works. With "Close button hide to tray" set to OFF, closing the window via the X button, the right-click taskbar menu, or Alt+F4 hides the tray icon, drops the tray reference, calls `QApplication.quit()`, and accepts the close event so the process terminates within a second. The tray icon used to keep the QApplication alive after the window closed, leaving an orphan SteaMidra in the background that only Task Manager could kill. ON branch keeps the existing hide-to-tray behaviour
+- Show-software-in-Store toggle now actually filters. Flipping the setting clears `store_browser._cached_grid` and forces the `_STEAM_APPLIST_CACHE` TTL to 0 so the next Store request rebuilds. `list_games` reads the setting on every call and drops every entry whose `type` equals `"software"` when the toggle is OFF, regardless of what `IStoreService/GetAppList`'s `include_software` parameter returned. The result set changes within one round trip after a flip
+
+### DLC check
+
+- DLC check no longer crashes with `No module named 'rich._unicode_data.unicode17-0-0'` in the frozen build. The legacy `lumacore.dlc_check` and `sls.dlc_check` paths used to build a Rich console table the Web UI never displayed, and the lazy `rich._unicode_data` import failed under PyInstaller. Both `dlc_check` paths now print a plain text table directly. `build_sff.spec` adds `rich._unicode_data`, `rich.box`, `rich.text` to `hiddenimports` plus `collect_data_files("rich", include_py_files=False)` for the SLSsteam codepath that still uses Rich, and the spec aborts with a clear error before PyInstaller's analysis pass when either of those entries is missing
+- Hubcap merge alias-expands the user query before sending it to Hubcap. Typing "gta san andreas" used to send "gta san andreas" verbatim, which Hubcap matches as a plain substring against game names where the classic title is stored as "Grand Theft Auto: San Andreas" with no "GTA" anywhere. The merge step now also queries Hubcap with "grand theft auto san andreas" (and the matching expansion for re, cod, rdr, kh, er, wukong, and the rest of the alias map), then dedupes results by appid
+- Hubcap merge filters out macOS-only and Linux-only entries. Searching "grand theft auto san andreas" no longer shows the Mac port (appid 12250) alongside the Windows classic (12120) and the Definitive Edition (1547000)
+- Switched the Steam metadata lookup from `appdetails` (rate-limited at 200 req / 5 min, returning HTTP 429 mid-search) to `IStoreBrowseService/GetItems` (batched up to 50 appids per call, no per-IP rate limit), so the type signal actually arrives instead of falling through
+
+### DLC check
+
+- The DLC check button now actually shows something. The old code piped a Rich console table into stdout that the Web UI never displayed, so clicking the button looked like a no-op. New `dlc_check_get_list` slot returns structured JSON, and a new modal renders the DLC list with status (Unlocked / Missing), app id, name, and depot / appid type. Reads from the Steam Web API when available, falls back to Steam Store `appdetails` when the Web client times out
+
+### Linux
+
+- Fixed blank / white WebEngine window on Linux Wayland sessions. Two users on KDE Plasma Wayland reported the GUI launching with the chrome rendered but the page area completely blank. Diagnostic logs confirmed the WebEngine renderer was producing frames and the WebChannel handshake was completing — the JS app loaded translations and fetched the game list — but the dma-buf textures the compositor hands to Wayland never made it to the screen. ANGLE-on-Wayland with Intel UHD + Mesa is the bad combination; the renderer logs say `EGL: MESA extensions found but missing EGL_MESA_drm_image, will use dma-buf, some older graphics cards may not be supported` and then silently fails to display. Switched the Linux-only Chromium flags to `--no-sandbox --disable-gpu-compositing --use-gl=desktop` so page rasterization still runs on the GPU but the final compositing step moves to software, bypassing the dma-buf import path entirely. Windows keeps the existing `--ignore-gpu-blocklist --enable-gpu-rasterization --enable-zero-copy` flags since they're not affected
+- DDMod now runs on Linux instead of getting skipped. The previous Linux flow stopped after writing manifests + ACF and told the user to open Steam and click Update, expecting SLSteam to pull the content. That worked in some setups but failed silently in others, so users got a "download finished" message with no game content on disk. DDMod is the reliable content-fetch path on both Windows and Linux when .NET 9 is present, and SteaMidra now installs .NET 9 automatically on first Linux launch, so this path Just Works
+- Steamless on Linux now uses the framework-dependent `Steamless.CLI.dll` via `dotnet` instead of running the Windows `Steamless.CLI.exe` through Wine. The Library tab Steamless flow (`game_specific.py`) and the Fix Game SteamStub unpacker both pick the DLL up automatically when on Linux. Wine fallback stays in place when the DLL is missing, so distros without .NET 9 keep working
+- .NET 9 now installs automatically on first Linux launch when missing. Previously the user had to run Linux Tools Setup once before any download or Steamless action would work; now SteaMidra spawns `dotnet-install.sh` on a daemon thread 6 seconds after the window paints, so the runtime lands in `~/.dotnet/` while the user is still browsing the home page. Failures log to `debug.log` and don't block the GUI
+
+### Home page
+
+- Achievement Data button now flags itself as Goldberg-only with a yellow warning subtitle. The button downloads `UserGameStats_*.bin` for Goldberg / GBE setups and is not needed when LumaCore is installed (LumaCore handles achievements through Steam natively). Misuse with LumaCore could overwrite the on-disk achievement cache, so the tooltip and subtitle now make the scope clear
+
+### Bulk import — drag and drop
+
+- Drag-and-drop into the Bulk Import drop zone works again. QtWebEngine 6.10 ships Chromium 124 which removed the non-standard `file.path` property, so dropped Lua / manifest files were arriving at the bridge with just the bare filename. The bridge then resolved that against the working directory (giving an invalid path), the first drop failed with "not there", and a second drop hit the dedupe set with the same invalid path and reported "already there". Drop now reads each file's content via `FileReader.readAsDataURL`, base64-encodes it, and ships `{name, content_b64}` to a new `enqueue_dropped_blobs` slot that materializes the bytes under `<sff_data>/.bulk_import_drop/` and runs the standard pipeline. The result list shows the original filename instead of the temp path
+
 ## 6.2.4
 
 ### LumaCore — CD key bypass
@@ -25,8 +287,6 @@
 
 - Common franchise abbreviations work in the search box. Typing `gta` finds Grand Theft Auto, `re` finds Resident Evil, `cod` Call of Duty, `rdr` Red Dead, `kh` Kingdom Hearts, `er` Elden Ring, `tf2` Team Fortress 2, `cs2` Counter-Strike 2, and so on. Full names still match the same way they did
 - Hubcap entries that aren't in Steam's catalog now merge into search results when a Hubcap key is configured. Delisted titles like classic Grand Theft Auto: San Andreas show up alongside the regular Steam hits instead of being silently dropped
-- Hubcap merge now alias-expands the user query before sending it to Hubcap. Typing "gta san andreas" used to send "gta san andreas" verbatim, which Hubcap matches as a substring against game names where the classic title is stored as "Grand Theft Auto: San Andreas" with no "GTA" anywhere. The merge step now also queries Hubcap with "grand theft auto san andreas" (and the matching expansion for re, cod, rdr, kh, er, wukong, all the other aliases) and dedupes results by appid, so abbreviated typing finally surfaces the delisted classics on Hubcap-keyed setups
-- Hubcap merge filters out macOS-only and Linux-only entries. Searching "grand theft auto san andreas" no longer shows the Mac port (appid 12250) alongside the Windows classic (12120) and the Definitive Edition (1547000). Hubcap's API doesn't carry platform info, so each Hubcap-only candidate gets a tiny `appdetails?filters=platforms` lookup against Steam, cached for the lifetime of the process. Entries Steam can't resolve (delisted, no data) stay in the list so genuine classics aren't dropped
 - Oureveryday Lua now includes appid-only DLCs (the kind that don't ship their own depot). The downloader pulls `extended.listofdlc` from the game's app info and writes one `addappid(<dlc_id>)` line per entry under the keyed lines. LumaCore picks them up on the next license refresh, so the DLC unlocks without needing the user to add it manually
 
 ### Achievements
@@ -47,6 +307,9 @@
 
 - `LumaCoreForWork/allgames/download_zips.py` (the bulk .lua downloader) no longer pegs the CPU. Rewritten on asyncio with HTTP/2 connection pooling, separate semaphores for network vs decompression (decompress capped at half the cpu count), and per-appid parallel source fetching so wall time per appid is `max(source1, source2)` instead of `source1 + source2`. The output directory is scanned once at startup instead of once per worker per appid. Tunable via `DZ_NET` / `DZ_CPU` / `DZ_TIMEOUT` env vars
 
+
+</content>
+</file>
 ### LumaCore-required notice
 
 - Added a blue notice banner above the existing Steam-error-54 banner on the home page. It tells users that adding games to their Steam library and downloading them needs LumaCore installed first, and points them at Auto LC Setup in Quick Tools below. This is for the users who don't read the guide

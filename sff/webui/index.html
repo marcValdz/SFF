@@ -143,11 +143,126 @@
                 </div>
             </div>
 
-            <div class="hint-banner" data-tooltip="Steam DRM (SteamStub) protects some games like Teardown, Doom Eternal, Resident Evil. LumaCore can fake ownership but the wrapper still does its own local check and the game refuses to launch.">
+            <div class="hint-banner" data-tooltip="Steam DRM (SteamStub) protects some games like Teardown, Doom Eternal, Resident Evil, Lost Planet 2, and other older titles. LumaCore can fake ownership but the wrapper still does its own local check and the game refuses to launch.">
                 <svg class="hint-icon" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
                 <div class="hint-text">
-                    <strong>Hitting Steam error 54 when launching a game?</strong>
-                    The game uses Steam DRM (SteamStub). LumaCore can't bypass the wrapper's local check on its own. Use <em>Remove DRM (Steamless)</em> below to strip the wrapper. Achievement-safe.
+                    <strong>Hitting Steam error 53 / 54 or "Application load error 6:0000065432" when launching a game?</strong>
+                    The game uses Steam DRM (SteamStub). The 6:0000065432 popup is the same root cause on older titles, just a different code. LumaCore can't bypass the wrapper's local check on its own. Use <em>Remove DRM (Steamless)</em> below to strip the wrapper. Achievement-safe. <br>
+                    <strong>Game says EAC isn't installed or won't launch with anti-cheat errors?</strong>
+                    <button id="btn-eac-guide" class="hint-inline-btn" type="button">Show EAC fix steps</button>
+                    <br>
+                    <strong>Steam says "Content Still Encrypted" on update or download?</strong>
+                    The manifests for that game are missing or stale. Run <em>Update All Games</em> from the home page to redownload them through SteaMidra.
+                </div>
+            </div>
+
+            <div id="eac-guide-modal" class="modal hidden">
+                <div class="modal-overlay"></div>
+                <div class="modal-content" style="max-width:760px;">
+                    <div class="modal-header">
+                        <h2>EAC fixes — disable EAC for offline / performance</h2>
+                        <button class="modal-close" data-tooltip="Close">&times;</button>
+                    </div>
+                    <div class="modal-body">
+                        <p style="margin-top:0;">SteaMidra's tools (Goldberg, Remove DRM, SteamAutoCrack) do <strong>not</strong> fix EAC. EAC is a separate kernel-level service the game itself loads. Use one of the methods below. Methods are ranked easiest first. Try them in order.</p>
+                        <p style="opacity:0.75;font-size:13px;">For competitive online games (Apex, Rust, Fortnite, Dead by Daylight) bypassing EAC will get you banned. Only use these for offline / single-player / modding.</p>
+
+                        <div class="eac-page-tabs" style="display:flex;gap:6px;flex-wrap:wrap;margin:12px 0;">
+                            <button class="eac-tab eac-tab-active" data-page="1" type="button">1. Verify + first launch</button>
+                            <button class="eac-tab" data-page="2" type="button">2. Steam launch options</button>
+                            <button class="eac-tab" data-page="3" type="button">3. Rename EAC folder</button>
+                            <button class="eac-tab" data-page="4" type="button">4. Executable swap</button>
+                            <button class="eac-tab" data-page="5" type="button">5. steam_appid.txt / .bat</button>
+                            <button class="eac-tab" data-page="6" type="button">6. Firewall block</button>
+                            <button class="eac-tab" data-page="7" type="button">7. Crack files</button>
+                        </div>
+
+                        <div class="eac-page" data-page="1">
+                            <h3 style="margin-top:0;">1. Verify game files, then launch once with EAC armed</h3>
+                            <p>Easiest one. Works when EAC service files got corrupted or the local EAC client never bootstrapped. Try this <strong>before</strong> anything else.</p>
+                            <ol style="line-height:1.7;">
+                                <li>Open Steam, right-click the game, then <strong>Properties</strong>.</li>
+                                <li>Open <strong>Installed Files</strong> (or <strong>Local Files</strong> on older Steam).</li>
+                                <li>Click <strong>Verify integrity of game files</strong> and let it finish.</li>
+                                <li>Launch the game once <strong>with EAC enabled</strong>. Wait until the EAC installer prompt finishes or the title screen renders, then close the game.</li>
+                                <li>Now retry whatever you were doing. The EAC service is registered on disk so any further launch (cracked or vanilla) sees a sane environment.</li>
+                            </ol>
+                            <p style="opacity:0.85;">If the game already loaded once with EAC armed and still throws the error, jump to method 2.</p>
+                        </div>
+
+                        <div class="eac-page hidden" data-page="2">
+                            <h3 style="margin-top:0;">2. Steam launch options</h3>
+                            <p>Some games respect a launch-arg toggle. Right-click the game, <strong>Properties</strong>, scroll to <strong>Launch Options</strong>, paste one of these and try the game:</p>
+                            <pre style="background:rgba(0,0,0,0.25);padding:10px;border-radius:4px;line-height:1.5;">-noeac
+-eac-nop
+--no-anti-cheat</pre>
+                            <p>Test one at a time. If the game still boots EAC, the dev didn't expose a flag. Move to method 3.</p>
+                        </div>
+
+                        <div class="eac-page hidden" data-page="3">
+                            <h3 style="margin-top:0;">3. Rename the EasyAntiCheat folder</h3>
+                            <p>Works on titles where EAC is loosely integrated. Game falls through to offline mode if it can't find the EAC dir.</p>
+                            <ol style="line-height:1.7;">
+                                <li>Right-click the game in Steam, <strong>Manage</strong>, <strong>Browse local files</strong>.</li>
+                                <li>Find the <code>EasyAntiCheat</code> folder.</li>
+                                <li>Rename it to <code>EasyAntiCheat_BACKUP</code>.</li>
+                                <li>Launch the game from its main <code>.exe</code> directly, not through Steam.</li>
+                            </ol>
+                            <p>If the game crashes instantly, EAC is deeply integrated and this won't work. Restore the folder name and try method 4.</p>
+                        </div>
+
+                        <div class="eac-page hidden" data-page="4">
+                            <h3 style="margin-top:0;">4. Executable swap (FromSoftware-style)</h3>
+                            <p>The classic Elden Ring / Armored Core VI offline trick. Steam thinks it's launching the EAC wrapper but actually launches the raw game.</p>
+                            <ol style="line-height:1.7;">
+                                <li>Open the game's install folder.</li>
+                                <li>Find the EAC launcher (usually <code>start_protected_game.exe</code> or <code>EACLauncher.exe</code>).</li>
+                                <li>Rename it to <code>start_protected_game_BACKUP.exe</code>.</li>
+                                <li>Find the real game executable (e.g. <code>eldenring.exe</code>). Copy it.</li>
+                                <li>Rename the copy to match the original wrapper name (<code>start_protected_game.exe</code>).</li>
+                                <li>Launch through Steam normally.</li>
+                            </ol>
+                            <p>Game boots straight into offline mode. Multiplayer is gone, single-player and mods work.</p>
+                        </div>
+
+                        <div class="eac-page hidden" data-page="5">
+                            <h3 style="margin-top:0;">5. steam_appid.txt or a .bat launcher</h3>
+                            <p>Most common bypass for Unreal Engine games. Skips the Steam bootstrapper that loads EAC.</p>
+                            <p><strong>steam_appid.txt:</strong></p>
+                            <ol style="line-height:1.7;">
+                                <li>Browse to where the actual game <code>.exe</code> lives (often <code>Binaries/Win64</code>).</li>
+                                <li>Create a new file named exactly <code>steam_appid.txt</code>.</li>
+                                <li>Paste the game's Steam App ID inside (the number from the Steam store URL). Save.</li>
+                                <li>Launch the game by double-clicking the <code>.exe</code>, NOT through Steam.</li>
+                            </ol>
+                            <p>If the game errors out with "tampered file", use a .bat instead. Same folder as the .exe, paste this and rename App ID + exe name:</p>
+                            <pre style="background:rgba(0,0,0,0.25);padding:10px;border-radius:4px;line-height:1.5;">set SteamAppId=1234567
+set SteamGameId=1234567
+start YourGame-Shipping.exe</pre>
+                            <p>Save as <code>LaunchOffline.bat</code>. Double-click to play.</p>
+                        </div>
+
+                        <div class="eac-page hidden" data-page="6">
+                            <h3 style="margin-top:0;">6. Firewall block (zero-risk offline)</h3>
+                            <p>Cuts the game's network access so EAC can't reach its servers. Forces local offline mode without touching any game files. Safest of the bunch.</p>
+                            <ol style="line-height:1.7;">
+                                <li>Start menu, type <strong>Windows Defender Firewall with Advanced Security</strong>, open it.</li>
+                                <li>Left sidebar, <strong>Outbound Rules</strong>.</li>
+                                <li>Right sidebar, <strong>New Rule</strong>.</li>
+                                <li>Pick <strong>Program</strong>, browse to the game's main <code>.exe</code>.</li>
+                                <li>Choose <strong>Block the connection</strong>. Leave Domain / Private / Public all checked.</li>
+                                <li>Name it (e.g. "Block Elden Ring online") and finish.</li>
+                            </ol>
+                            <p>Game boots, EAC fails to phone home, game falls through to offline mode. No file edits needed.</p>
+                        </div>
+
+                        <div class="eac-page hidden" data-page="7">
+                            <h3 style="margin-top:0;">7. Crack / fix files</h3>
+                            <p>If none of the above work, the game's EAC integration is too deep and you'll need pre-made crack files for that specific title. Check the game's NexusMods page or its modding subreddit and look for "EAC bypass" or "offline launcher". Drop the files in per the README they ship with.</p>
+                            <p>SteaMidra's <em>Crack Files</em> button on the home page also pulls community-maintained fix files from the CrakFiles repo for some games. Try that first before hunting on Nexus.</p>
+                            <p style="opacity:0.75;font-size:13px;">Don't ever launch a cracked online game on official servers. Permanent ban risk.</p>
+                        </div>
+                    </div>
                 </div>
             </div>
 
@@ -242,8 +357,8 @@
                     </button>
                     <button class="action-card" data-action="update_manifests" data-tooltip="Re-download all manifests for games in your AppList to get the latest versions">
                         <svg class="action-icon" viewBox="0 0 24 24"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 11-2.12-9.36L23 10"/></svg>
-                        <span class="action-title">Update All Manifests</span>
-                        <span class="action-desc">Refresh all game manifests</span>
+                        <span class="action-title">Update All Games</span>
+                        <span class="action-desc">Refresh all installed games</span>
                     </button>
                 </div>
             </div>
@@ -255,13 +370,18 @@
                         <svg class="action-icon" viewBox="0 0 24 24"><path d="M14.7 6.3a1 1 0 000 1.4l1.6 1.6a1 1 0 001.4 0l3.77-3.77a6 6 0 01-7.94 7.94l-6.91 6.91a2.12 2.12 0 01-3-3l6.91-6.91a6 6 0 017.94-7.94l-3.76 3.76z"/></svg>
                         <span class="action-title">Workshop Item</span>
                     </button>
+                    <button class="action-card compact" data-action="workshop_import" id="action-workshop-import" data-tooltip="Scan steamapps/workshop/content/<appid>/ and queue every not-yet-downloaded subscribed mod">
+                        <svg class="action-icon" viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+                        <span class="action-title">Import Subscribed Mods</span>
+                    </button>
                     <button class="action-card compact platform-win" data-action="hv_fix" data-tooltip="Temporarily disabled — HVAuto's host (buzzheavier) is serving malware ads. Will be re-enabled when fixes move to a safer host.">
                         <svg class="action-icon" viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/><line x1="9" y1="2" x2="9" y2="4"/><line x1="15" y1="2" x2="15" y2="4"/><line x1="9" y1="20" x2="9" y2="22"/><line x1="15" y1="20" x2="15" y2="22"/><line x1="2" y1="9" x2="4" y2="9"/><line x1="2" y1="15" x2="4" y2="15"/><line x1="20" y1="9" x2="22" y2="9"/><line x1="20" y1="15" x2="22" y2="15"/></svg>
                         <span class="action-title">HyperVisor (HVAuto)</span>
                     </button>
-                    <button class="action-card compact" data-action="achievements" data-tooltip="View and manage achievement data for a game">
+                    <button class="action-card compact" data-action="achievements" data-tooltip="Downloads UserGameStats_*.bin and the achievement schema for use with the Goldberg / GBE emulator. NOT needed when LumaCore is installed — achievements work through Steam natively. Only use this with games that have been cracked with Goldberg.">
                         <svg class="action-icon" viewBox="0 0 24 24"><circle cx="12" cy="8" r="7"/><polyline points="8.21 13.89 7 23 12 20 17 23 15.79 13.88"/></svg>
                         <span class="action-title">Achievement Data</span>
+                        <span class="action-desc warn-achievements">For Goldberg only — not needed with LumaCore</span>
                     </button>
                     <button class="action-card compact" data-action="mute_toggle" data-tooltip="Toggle Steam game mute/unmute">
                         <svg class="action-icon" viewBox="0 0 24 24"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><line x1="23" y1="9" x2="17" y2="15"/><line x1="17" y1="9" x2="23" y2="15"/></svg>
@@ -274,6 +394,11 @@
                     <button class="action-card compact platform-win" data-action="context_menu" data-tooltip="Install or remove the SteaMidra context menu in Windows Explorer">
                         <svg class="action-icon" viewBox="0 0 24 24"><path d="M22 19a2 2 0 01-2 2H4a2 2 0 01-2-2V5a2 2 0 012-2h5l2 3h9a2 2 0 012 2z"/></svg>
                         <span class="action-title">Context Menu</span>
+                    </button>
+                    <button class="action-card compact platform-win" data-action="steam_updates" id="action-steam-updates" data-tooltip="Block or unblock Steam client auto-updates by writing BootStrapperInhibitAll to steam.cfg in the Steam directory">
+                        <svg class="action-icon" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><line x1="4.93" y1="4.93" x2="19.07" y2="19.07"/></svg>
+                        <span class="action-title">Steam Updates</span>
+                        <span class="action-desc">Block / unblock auto-updates</span>
                     </button>
                     <button class="action-card compact" data-action="check_mod_updates" data-tooltip="Check if your tracked Steam Workshop items have new updates">
                         <svg class="action-icon" viewBox="0 0 24 24"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 11-2.12-9.36L23 10"/></svg>
@@ -737,6 +862,17 @@
                     </div>
                 </div>
                 <button id="provider-save-config" class="btn btn-primary" style="margin-top:10px;display:none">Save Provider Config</button>
+
+                <div id="cloud-backup-dest-row" class="input-group" style="margin-top:12px;">
+                    <label>Local Backup Folder:
+                        <small style="opacity:0.6;">(where your Steam-cloud saves get copied to)</small>
+                    </label>
+                    <div class="input-with-btn">
+                        <input type="text" id="cloud-backup-dest" placeholder="Browse to a folder on your PC..." data-tooltip="The folder Local-provider backups will be saved to. Each game gets its own subfolder named like 'Game Name [AppID]\remote'.">
+                        <button id="cloud-backup-browse" class="btn">Browse</button>
+                    </div>
+                    <small style="opacity:0.55;">Defaults to <code>%APPDATA%\SteaMidra\save_backups\</code> if you leave this blank, but the per-game backup goes wherever you point this.</small>
+                </div>
             </div>
 
             <div class="cloudsaves-setup">
@@ -1009,7 +1145,7 @@
                 <div class="input-group">
                     <label>Exclude from Manifest Updates:</label>
                     <div class="input-with-btn">
-                        <input type="text" id="setting-manifest-excludes" placeholder="App IDs, comma-separated (e.g. 480,1234)" data-tooltip="These App IDs will be skipped by Update All Manifests and Auto-Update Manifests">
+                        <input type="text" id="setting-manifest-excludes" placeholder="App IDs, comma-separated (e.g. 480,1234)" data-tooltip="These App IDs will be skipped by Update All Games and Auto-Update Manifests">
                         <button id="setting-manifest-excludes-save" class="btn">Save</button>
                     </div>
                 </div>
@@ -1439,7 +1575,7 @@
         <div class="modal-overlay"></div>
         <div class="modal-content">
             <div class="modal-header">
-                <h2>Update All Manifests</h2>
+                <h2>Update All Games</h2>
                 <button class="modal-close">&times;</button>
             </div>
             <div class="modal-body">
@@ -1598,6 +1734,32 @@
         </div>
     </div>
 
+    <!-- DLC Check Modal -->
+    <div id="dlc-check-modal" class="modal hidden">
+        <div class="modal-overlay"></div>
+        <div class="modal-content" style="max-width:680px;">
+            <div class="modal-header">
+                <div>
+                    <h2 id="dlc-check-title">DLC Check</h2>
+                    <p id="dlc-check-summary" class="modal-subtitle"></p>
+                </div>
+                <button class="modal-close" aria-label="Close">&times;</button>
+            </div>
+            <div id="dlc-check-body" class="modal-body" style="max-height:60vh;overflow-y:auto;">
+            </div>
+            <div class="modal-footer" style="justify-content:space-between;flex-wrap:wrap;gap:8px;">
+                <div id="dlc-check-bulk-actions" style="display:none;gap:8px;flex-wrap:wrap;">
+                    <span style="font-size:12px;color:var(--fg-muted);align-self:center;">Download checked DLCs through:</span>
+                    <button class="btn dlc-bulk-dl" data-source="hubcap">Hubcap</button>
+                    <button class="btn dlc-bulk-dl" data-source="oureveryday">Oureveryday</button>
+                    <button class="btn dlc-bulk-dl" data-source="ryuu">Ryuu</button>
+                    <button class="btn dlc-bulk-dl" data-source="local">Local files</button>
+                </div>
+                <button class="btn modal-cancel">Close</button>
+            </div>
+        </div>
+    </div>
+
     <!-- Toast Container -->
     <div id="toast-container" class="toast-container"></div>
 
@@ -1617,5 +1779,6 @@
     <script src="js/cloudsaves.js"></script>
     <script src="js/settings.js"></script>
     <script src="js/bulk_import.js"></script>
+    <script src="js/dlc_check.js"></script>
 </body>
 </html>
